@@ -1,6 +1,71 @@
 # First port: length-aware DSV4.1 candidate selection
 
-Status: design. No replacement kernel is enabled or implemented by this change.
+Status: experimental score-kernel prototype, disabled by default. The complete
+selector still uses full-width `torch.topk`; this is not a completed port of
+DeepSelect or a validated serving optimization.
+
+## Running the prototype
+
+Set `VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES=1` before starting the test process.
+The score kernel skips loads and reductions for tiles entirely outside the
+row's valid context, writes their padding scores, and preserves the original
+newest-block rule. Score layout, top-k, candidate storage, call sites, and graph
+shapes remain unchanged. Reductions use FP32, with scores stored in the original
+dtype. Unset the flag or set it to `0` to select the baseline score path.
+
+On an isolated CUDA development allocation, run both paths' existing tests:
+
+```bash
+.venv/bin/python -m pytest \
+  tests/model_executor/layers/test_mla_short_prefill_indexer.py \
+  -q -k 'candidate or sparse_topk_remap'
+.venv/bin/python benchmarks/kernels/benchmark_dsv41_candidate_scores.py \
+  --rows 1 6 48 --width 278528 --output outputs/candidate-scores.json
+```
+
+The benchmark checks candidate equality before timing, alternates baseline and
+prototype order, and reports score, top-k, store, and complete-selector timings
+separately. It requests CUDA graph replay and cold L2 from FlashInfer's CUPTI
+helper; preserve its logs because that helper can fall back when CUPTI is absent.
+The score bandwidth metric counts valid logits read once plus all score writes;
+it excludes allocation, compilation, and other selector stages. These are kernel
+replay measurements, not serving latency or quality measurements.
+
+For a development overlay on the known v0.13.1 base:
+
+```bash
+docker build --file docker/Dockerfile.sm80-candidate \
+  --build-arg BASE_IMAGE="$BASE_IMAGE" \
+  --build-arg SOURCE_REVISION="$(git rev-parse HEAD)" \
+  --tag vllm-sm80-candidate:dev .
+```
+
+Set `BASE_IMAGE` to the tested base image's immutable reference. The overlay
+checks the original source hashes before replacing either file, records package
+versions and new source hashes in `/opt/sm80-candidate.json`, and leaves the flag
+off. It reuses the base's native extensions; it does not validate a full source
+build, publish an image, or start a model server.
+
+## Evidence available before GPU validation
+
+- 60 CPU Triton-interpreter cases passed: FP32/FP16, packed and decode bounds,
+  strides, repeated row metadata, empty and shortened contexts, ends beyond
+  allocated width, tied values, NaN and infinities. Both flag states matched
+  the original kernel's scores and top-k IDs and an independent PyTorch score
+  reference. The check used import/env stubs for the exact kernel source.
+- 12 explicit-target SM80 compilations passed: FP32/FP16/BF16, packed/decode,
+  and both flag states. Each produced SM80 PTX and cubin without initializing
+  CUDA. These configurations compile; this does not prove GPU execution.
+- BF16 interpreter execution is unavailable in Triton and is not counted as a
+  passed correctness case.
+- Eight additional CPU-interpreter output-storage cases passed, covering strided
+  outputs, untouched guard columns, NaN filtering, and `-1` padding.
+- The development overlay built successfully; a CPU-only smoke check verified
+  both installed source hashes and the flag's default/off/on behavior. Its
+  preimage guard also rejected an already modified base.
+- GPU unit tests, CUDA-graph execution, kernel timings, serving A/B, and model
+  quality evaluation remain pending an isolated allocation. There is no measured
+  A100 speedup and no basis for changing the default yet.
 
 ## Problem and source
 
@@ -71,7 +136,8 @@ Run the relevant existing suite in the CUDA development environment:
   -q -k 'candidate or sparse_topk_remap'
 ```
 
-This command has not been run as part of the fork bootstrap.
+The GPU suite above remains pending; the CPU and compilation checks do not
+substitute for it.
 
 ## Measurement and acceptance
 

@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm import envs
 from vllm.triton_utils import tl, triton
 
 
@@ -27,6 +28,7 @@ def _block_scores_kernel(
     HAS_STARTS: tl.constexpr,
     ROW_REPEAT: tl.constexpr,
     TILE: tl.constexpr,
+    LENGTH_AWARE: tl.constexpr = False,
 ):
     row = tl.program_id(0).to(tl.int64)
     blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)
@@ -34,15 +36,19 @@ def _block_scores_kernel(
     end = tl.load(ends + row // ROW_REPEAT * stride_end)
     offsets = tl.arange(0, triton.next_power_of_2(BLOCK_SIZE))
     cols = start + blocks[:, None] * BLOCK_SIZE + offsets[None, :]
-    values = tl.load(
-        logits + row * stride_row + cols * stride_col,
-        (blocks[:, None] < nblocks)
-        & (offsets[None, :] < BLOCK_SIZE)
-        & (cols < end)
-        & (cols < width),
-        other=-float("inf"),
-    )
-    reduced = tl.reduce(values, 1, _max_with_nan)
+    reduced = tl.full((TILE,), -float("inf"), tl.float32)
+    if not LENGTH_AWARE or start + tl.program_id(1) * TILE * BLOCK_SIZE < tl.minimum(
+        end, width
+    ):
+        values = tl.load(
+            logits + row * stride_row + cols * stride_col,
+            (blocks[:, None] < nblocks)
+            & (offsets[None, :] < BLOCK_SIZE)
+            & (cols < end)
+            & (cols < width),
+            other=-float("inf"),
+        ).to(tl.float32)
+        reduced = tl.reduce(values, 1, _max_with_nan)
     reduced = tl.where(
         (end > start) & (blocks == (end - start - 1) // BLOCK_SIZE),
         float("inf"),
@@ -174,6 +180,7 @@ def select_candidate_blocks(
         row_ks is not None,
         row_repeat,
         128,
+        LENGTH_AWARE=envs.VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES,
     )
     # Keep the existing top-k tie behavior.
     top = scores.topk(min(topk_blocks, nblocks), dim=-1)

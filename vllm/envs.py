@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     ] = "relax"
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
+    VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES: bool = False
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
@@ -2297,6 +2298,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # which has its own split tuning.
     "VLLM_DSV4_FIXED_DECODE_SPLITS": lambda: int(
         os.environ.get("VLLM_DSV4_FIXED_DECODE_SPLITS", "0")
+    ),
+    # Skip reductions for candidate-score tiles wholly outside each row's
+    # valid context. Keep the full score layout and torch.topk tie behavior.
+    "VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES": lambda: (
+        os.environ.get("VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES", "0") == "1"
     ),
     # Row-chunk the SM80/SM86 sparse-indexer prefill logits (allover326's
     # long-context fix from #50576): compute the [M, N] fp32 logits transient

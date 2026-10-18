@@ -7,6 +7,7 @@ import pytest
 import torch
 
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
+from vllm import envs
 from vllm.config import CUDAGraphMode
 from vllm.models.deepseek_v32 import attention as deepseek_v32_attention
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
@@ -293,10 +294,12 @@ def test_deepseek_v32_dispatches_selected_mha(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_select_candidate_blocks_tolerates_empty_rows():
+@pytest.mark.parametrize("length_aware", [False, True])
+def test_select_candidate_blocks_tolerates_empty_rows(monkeypatch, length_aware):
     """Full-cudagraph decode pads the batch with seq_len-0 rows. The newest
     block pin must not index -1 for them (device-side assert); they select
     no candidate blocks and real rows still pin their newest block."""
+    monkeypatch.setattr(envs, "VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES", length_aware)
     block_size, topk_blocks = 8, 3
     logits = torch.zeros(3, 64, device="cuda")
     logits[0, 3] = 5.0  # block 0 scores highest for row 0
@@ -316,6 +319,7 @@ def test_select_candidate_blocks_tolerates_empty_rows():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("length_aware", [False, True])
 @pytest.mark.parametrize(
     "width,block_size,k,decode",
     [
@@ -326,7 +330,7 @@ def test_select_candidate_blocks_tolerates_empty_rows():
     ],
 )
 def test_candidate_kernels_preserve_packed_bounds_and_padding(
-    width, block_size, k, decode
+    monkeypatch, length_aware, width, block_size, k, decode
 ):
     """Preserve top-k ties, newest blocks, empty rows and candidate clamping."""
     from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
@@ -334,6 +338,7 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
         select_candidate_blocks,
     )
 
+    monkeypatch.setattr(envs, "VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES", length_aware)
     torch.manual_seed(42)
     rows = 6
     logits = torch.randn(rows, width * 2, device="cuda")[:, ::2]
@@ -400,3 +405,39 @@ def test_candidate_kernels_preserve_packed_bounds_and_padding(
         keep = valid & (block >= 0) & ((cols - ks[:, None]) // block_size == block)
         reference = torch.where(keep, 3.0, -torch.inf)
         torch.testing.assert_close(logits, reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_candidate_length_aware_scores_replay_changing_bounds(monkeypatch, dtype):
+    """A shorter replay must overwrite old scores, including tied and NaN rows."""
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        select_candidate_blocks,
+    )
+
+    torch.manual_seed(42)
+    width, rows, k, block_size = 8193, 6, 33, 8
+    logits = torch.randn(rows, width * 2, device="cuda", dtype=dtype)[:, ::2]
+    logits[0].fill_(0)
+    logits[1, 7] = torch.nan
+    logits[2, 17] = torch.inf
+    logits[3].fill_(-torch.inf)
+    starts = torch.tensor([0, 3, width - 1], device="cuda", dtype=torch.int64)
+    ends = torch.full((3,), width, device="cuda", dtype=torch.int32)
+    actual = torch.full((rows, k * 2), -9, device="cuda", dtype=torch.int32)[:, ::2]
+    expected = torch.empty_like(actual)
+    monkeypatch.setattr(envs, "VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES", True)
+    select_candidate_blocks(logits, starts, ends, k, block_size, actual, row_repeat=2)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        select_candidate_blocks(
+            logits, starts, ends, k, block_size, actual, row_repeat=2
+        )
+    for bounds in ([0, 3, width - 1], [1, 5, width + 3], [width, width, width]):
+        ends.copy_(torch.tensor(bounds, dtype=ends.dtype, device="cuda"))
+        graph.replay()
+        monkeypatch.setattr(envs, "VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES", False)
+        select_candidate_blocks(
+            logits, starts, ends, k, block_size, expected, row_repeat=2
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
