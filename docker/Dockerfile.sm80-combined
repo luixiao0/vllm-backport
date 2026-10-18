@@ -1,0 +1,13 @@
+ARG BASE_IMAGE=sha256:3cb1e6664b311dd0b5e7670de2327bc61b47672f2d12dd476922c79e97917c75
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION=development
+LABEL org.opencontainers.image.source="https://github.com/luixiao0/vllm-backport" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}"
+ENV VLLM_USE_V2_MODEL_RUNNER=1 \
+    VLLM_DSV4_CANDIDATE_SELECTION_BACKEND=triton_radix \
+    VLLM_DSV41_MHC_OVERLAP=1 \
+    VLLM_DSV41_SPARSE_MQA=0
+COPY docker/sm80/dsv41-general.env docker/sm80/dsv41-long-context.env /opt/sm80-profiles/
+COPY benchmarks/kernels/benchmark_dsv41_sm80_combined.py \
+     benchmarks/kernels/benchmark_dsv41_mhc_overlap.py \
+     benchmarks/kernels/benchmark_dsv41_sparse_mqa.py /opt/sm80-probes/

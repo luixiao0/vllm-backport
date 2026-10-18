@@ -75,20 +75,55 @@ production `VLLM_USE_V2_MODEL_RUNNER` was unset; the installed configuration
 rejects DSpark under V1. The fact that DSpark is running therefore supports a
 V2 inference; this was not established by a retained startup log.
 
-## Candidate configuration
+## Combined deployment profiles
 
-The candidate retains conservative defaults:
+The combined image opts into the screened general profile:
 
 ```bash
+VLLM_USE_V2_MODEL_RUNNER=1
 VLLM_DSV4_CANDIDATE_SELECTION_BACKEND=triton_radix
+VLLM_DSV41_MHC_OVERLAP=1
 VLLM_DSV41_SPARSE_MQA=0
-VLLM_DSV41_MHC_OVERLAP=0
 ```
 
-The first flag selects the previously screened SM80 candidate block selector.
-The two new kernel paths can be enabled individually for their measured
-workloads. Engram TP sharding remains automatic. No checkpoint conversion or
-additional weight quantization is needed.
+[dsv41-general.env](../../docker/sm80/dsv41-general.env) combines radix candidate
+selection, small-FULL-graph mHC overlap, automatic Engram TP sharding and the V2
+cached-prompt graph path. The existing TP8/EP/DSpark5, official weights and serving
+arguments remain the deployment inputs. Python-level defaults for the two new
+kernel flags stay off; the combined image explicitly opts into this profile.
+
+[dsv41-long-context.env](../../docker/sm80/dsv41-long-context.env) additionally
+sets `VLLM_DSV41_SPARSE_MQA=1`. Use it for a dedicated long-context workload;
+short device replays under a long capture bound retain the documented regression.
+The mHC gate still limits overlap to at most 8 tokens in FULL capture and retains
+serial fallback elsewhere. No checkpoint conversion or additional quantization
+is needed.
+
+`docker/Dockerfile.sm80-combined` wraps the immutable tested series image with
+these profiles. It changes no installed model runtime source or native
+extension. The probe in `benchmarks/kernels/benchmark_dsv41_sm80_combined.py`
+places the actual source/consumer indexer bodies, radix selection, native mHC,
+and one native MXFP4 expert inside the same FULL graph. It checks actual dispatch
+counts, bitwise outputs, candidate sets, changed device lengths/input, and
+restore replay. BF16 attention remains a proxy; Engram TP collectives and global
+MoE routing are outside this joint boundary.
+
+The joint A100 screen uses six rows and a 131072-key capture bound. The serial
+Torch-selector/dense-indexer path takes 872.96 microseconds; the general profile
+takes 746.50 (-14.49%), and the long-context profile takes 694.78 (-20.41%). With
+8K device lengths under that same capture, general takes 401.41 microseconds
+while long-context takes 485.38 (+20.92% versus general). This confirms keeping
+sparse MQA out of the general profile. The benchmark includes actual source and
+consumer indexers, both native mHC stages and stream joins, the BF16 attention
+proxy, the native single-expert Marlin FFN, final post mixing, and small output
+snapshots. It is not whole-model ITL or tokens/s.
+
+All three profiles have bitwise-equal outputs and identical candidate sets at
+131K, 32K, and 8K device lengths, including changed inputs and a restore replay.
+Capture counters establish one radix source selection in the general profile,
+one additional compact consumer in the long-context profile, and two overlapped
+mHC stages in both. The external harness enforces fresh 2 GiB free-VRAM admission
+and a 240-second timeout; the Torch allocator cap is 256 MiB.
 
 All GPU measurements used independent bounded containers and spare VRAM on a
 resident-production A100. They used short interleaved CUDA-event graph samples,
