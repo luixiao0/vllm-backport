@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Screen radix/source MQA + consumer MQA + mHC in the same FULL graph.
 
-This is a synthetic decoder boundary, with the actual sparse-indexer custom-op
-body, source candidate selection, native mHC, and a native MXFP4 single expert.
-Attention math is a BF16 proxy. There are no Engram TP collectives, global MoE
-routing, production weights, serving-engine calls, profiling, or cache flushes.
+The default uses BF16 proxy attention and a native MXFP4 single expert.
+--native-consumers replaces them with Ampere FP8 MLA, native MXFP8 projections
+and 384-route/top6 native MXFP4 with eight materialized experts. Both include
+the actual sparse-indexer bodies and native mHC. There are no TP/EP collectives,
+production weights, serving-engine calls, profiling, or cache flushes.
 """
 
 import argparse
@@ -49,9 +50,11 @@ def run(args):
     assert args.shared_screening and current_platform.is_device_capability(80)
     assert torch.accelerator.device_count() == 1
     started = time.monotonic()
+    native_consumers = getattr(args, "native_consumers", False)
+    cap_bytes = (512 if native_consumers else 256) * 1024**2
     # The external harness checks fresh free VRAM before starting the container.
     total = current_platform.get_device_total_memory(0)
-    torch.cuda.set_per_process_memory_fraction(256 * 1024**2 / total)
+    torch.cuda.set_per_process_memory_fraction(cap_bytes / total)
     torch.set_num_threads(1)
     torch.manual_seed(113)
     # Avoid the baseline autotuner's 256 MiB cold-L2 allocation on shared GPUs.
@@ -108,7 +111,37 @@ def run(args):
     config = VllmConfig()
     results, graphs, outputs, capture_dispatch = [], {}, {}, {}
     with set_current_vllm_config(config), torch.inference_mode():
-        decoder = make_decoder("marlin_mxfp4")
+        consumer_hashes = None
+        consumer_helper_sha256 = None
+        consumer_references = {}
+        if native_consumers:
+            import benchmark_dsv41_native_consumers as native
+            from benchmark_dsv41_native_consumers import (
+                NativeAttention,
+                NativeMoE,
+                source_hashes,
+            )
+            from benchmark_dsv41_native_consumers import (
+                make_decoder as make_native_decoder,
+            )
+
+            from vllm.utils.torch_utils import set_default_torch_dtype
+
+            with set_default_torch_dtype(torch.bfloat16):
+                native_attention = NativeAttention(length)
+                native_attention.configure(rows)
+                decoder = make_native_decoder(native_attention, NativeMoE())
+                consumer_references["moe"] = decoder.ffn.check_reference(
+                    torch.randn(2, 5120, device="cuda", dtype=torch.bfloat16)
+                )
+            native_attention.kernel.topk_indices_buffer = consumer_topk
+            context.attn_metadata.update(native_attention.metadata)
+            consumer_hashes = source_hashes()
+            consumer_helper_sha256 = hashlib.sha256(
+                Path(native.__file__).read_bytes()
+            ).hexdigest()
+        else:
+            decoder = make_decoder("marlin_mxfp4")
         attention_proxy = decoder.attn
         side = torch.cuda.Stream()
         x = torch.randn(rows, 4, 5120, dtype=torch.bfloat16, device="cuda")
@@ -150,7 +183,11 @@ def run(args):
                 hidden.dtype
             )
 
-        decoder.attn = attention
+        class IndexedAttention(torch.nn.Module):
+            def forward(self, positions, hidden, ignored):
+                return attention(positions, hidden, ignored)
+
+        decoder.attn = IndexedAttention()
 
         def pipeline():
             out = decoder(x, positions, None, pre_mix=pre)
@@ -188,6 +225,10 @@ def run(args):
                 decoder.mhc_stream = side if overlap else None
                 pipeline()
                 torch.accelerator.synchronize()
+                if native_consumers and name == "serial_dense":
+                    consumer_references["attention"] = (
+                        native_attention.check_reference()
+                    )
                 counters.update(radix=0, compact=0, overlap=0)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
@@ -273,15 +314,22 @@ def run(args):
         elapsed_s=time.monotonic() - started,
         peak_allocated=torch.accelerator.memory.max_memory_allocated(),
         peak_reserved=torch.accelerator.memory.max_memory_reserved(),
-        cap_bytes=256 * 1024**2,
+        cap_bytes=cap_bytes,
         source_revision=json.loads(Path("/opt/sm80-series.json").read_text())[
             "source_revision"
         ],
         benchmark_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         boundary=(
             "synthetic decoder + source indexer/radix + consumer indexer + "
+            "native mHC + Ampere fp8_ds_mla + Marlin MXFP8 projections + "
+            "native MXFP4 384-route/top6/8-active-expert FFN"
+            if native_consumers
+            else "synthetic decoder + source indexer/radix + consumer indexer + "
             "native mHC/MXFP4 expert + BF16 attention proxy"
         ),
+        consumer_source_hashes=consumer_hashes,
+        consumer_helper_sha256=consumer_helper_sha256,
+        consumer_references=consumer_references,
         official_weights_loaded=False,
         engram_tp_collectives=False,
         model_tokens_per_second_measured=False,
@@ -292,5 +340,6 @@ def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--shared-screening", action="store_true")
+    parser.add_argument("--native-consumers", action="store_true")
     parser.add_argument("--output", required=True)
     run(parser.parse_args())

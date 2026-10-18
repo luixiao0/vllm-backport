@@ -15,9 +15,15 @@ limited to a standalone benchmark. An independent fix handles speculative
 
 `VLLM_DSV41_SPARSE_MQA=1` opts in. **Leave it at the default 0 for mixed-length
 serving.** A host capture bound cannot distinguish short device replay lengths
-inside a FULL graph. At a 278528 capture bound, 6 rows with 8K device lengths
+inside a FULL graph. In the initial release, at a 278528 capture bound,
+6 rows with 8K device lengths
 regressed from 112.6 to 146.9 microseconds (+30.5%). The corresponding 32K replay
-improved from 333.8 to 160.8 microseconds. This is a long-context specialization.
+improved from 333.8 to 160.8 microseconds.
+
+The [adaptive consumer follow-up](adaptive-consumer.md) replaces the preparation
+with a device-length-dependent identity/compact path, fuses query decoding and
+passes 76 GPU cases. It removes most of the short-row cost and further improves
+long rows. Small residual short-row regressions keep sparse MQA opt-in.
 
 The complete sort/dedup/score/top-k/remap pipeline measured 193 to 144
 microseconds for 6 rows and 131072 keys, and 456 to 167 microseconds for 6 rows
@@ -99,16 +105,20 @@ The mHC gate still limits overlap to at most 8 tokens in FULL capture and retain
 serial fallback elsewhere. No checkpoint conversion or additional quantization
 is needed.
 
-`docker/Dockerfile.sm80-combined` wraps the immutable tested series image with
-these profiles. It changes no installed model runtime source or native
-extension. The probe in `benchmarks/kernels/benchmark_dsv41_sm80_combined.py`
+`docker/Dockerfile.sm80-combined` wraps the immutable previous combined image,
+verifies and installs the single adaptive MQA file, and includes these profiles.
+Other model runtime files and native extensions are inherited unchanged.
+The probe in `benchmarks/kernels/benchmark_dsv41_sm80_combined.py`
 places the actual source/consumer indexer bodies, radix selection, native mHC,
 and one native MXFP4 expert inside the same FULL graph. It checks actual dispatch
 counts, bitwise outputs, candidate sets, changed device lengths/input, and
 restore replay. BF16 attention remains a proxy; Engram TP collectives and global
-MoE routing are outside this joint boundary.
+MoE routing are outside its default joint boundary. `--native-consumers` selects
+real FP8 MLA, native Marlin projections, FP32 GateLinear and 384-route/top-6
+MXFP4 with eight materialized experts. See the follow-up for current results.
 
-The joint A100 screen uses six rows and a 131072-key capture bound. The serial
+The original proxy-based joint A100 screen uses six rows and a 131072-key capture
+bound. The serial
 Torch-selector/dense-indexer path takes 872.96 microseconds; the general profile
 takes 746.50 (-14.49%), and the long-context profile takes 694.78 (-20.41%). With
 8K device lengths under that same capture, general takes 401.41 microseconds
