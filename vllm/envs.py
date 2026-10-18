@@ -325,6 +325,7 @@ if TYPE_CHECKING:
     VLLM_MHC_FIXED_NUM_SPLIT: int = 0
     VLLM_TOKEN_BUCKET_PAD: bool = True
     VLLM_DSPARK_FUSED_MARKOV: bool = True
+    VLLM_DSV41_DSPARK_CONTEXT_KV: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2318,6 +2319,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Shifted mHC coefficient overlap, screened only for small SM80 FULL graphs.
     "VLLM_DSV41_MHC_OVERLAP": lambda: (
         os.environ.get("VLLM_DSV41_MHC_OVERLAP", "0") == "1"
+    ),
+    # Experimental SM80 DSpark context-only grouped MXFP8 projection. Opt-in
+    # pending whole-model acceptance-rate and quality validation.
+    "VLLM_DSV41_DSPARK_CONTEXT_KV": lambda: (
+        os.environ.get("VLLM_DSV41_DSPARK_CONTEXT_KV", "0") == "1"
     ),
     # Row-chunk the SM80/SM86 sparse-indexer prefill logits (allover326's
     # long-context fix from #50576): compute the [M, N] fp32 logits transient

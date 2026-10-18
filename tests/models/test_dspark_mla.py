@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -266,3 +267,282 @@ def test_v41_dspark_loads_linear_scales(
     assert loaded == {runtime_name}
     assert shards == [() if shard_id is None else (shard_id,)]
     torch.testing.assert_close(param, checkpoint_scale)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "fallback",
+    [
+        None,
+        "device",
+        "block",
+        "scale",
+        "kernel",
+        "new_kernel",
+        "geometry",
+        "layers",
+        "sp",
+        "lora",
+        "disabled",
+    ],
+)
+def test_v41_context_projection_requires_screened_sm80_configuration(
+    monkeypatch, fallback
+):
+    from vllm.models.deepseek_v4_1.nvidia import dspark
+
+    monkeypatch.setattr(
+        dspark.envs, "VLLM_DSV41_DSPARK_CONTEXT_KV", fallback != "disabled"
+    )
+    monkeypatch.setattr(dspark.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        dspark.current_platform,
+        "is_device_capability",
+        lambda _cc: fallback != "device",
+    )
+    config = SimpleNamespace(
+        quant_config=SimpleNamespace(
+            weight_block_size=[32, 32], is_scale_e8m0=fallback != "scale"
+        )
+    )
+    kernel = object.__new__(dspark.MarlinMxfp8LinearKernel)
+    projections = [
+        SimpleNamespace(
+            input_size=5120,
+            output_sizes=[1280, 512],
+            disable_tp=True,
+            prefix=f"model.layers.{40 + i}.attn.fused_wqa_wkv",
+            quant_method=SimpleNamespace(kernel=kernel),
+        )
+        for i in range(3)
+    ]
+    if fallback == "kernel":
+        projections[1].quant_method.kernel = object()
+    if fallback == "geometry":
+        projections[1].output_sizes = [1280, 1024]
+    if fallback == "block":
+        config.quant_config.weight_block_size = [128, 128]
+    if fallback == "layers":
+        projections.pop()
+    if fallback == "lora":
+        config.lora_config = SimpleNamespace()
+    layers = [
+        SimpleNamespace(attn=SimpleNamespace(fused_wqa_wkv=p)) for p in projections
+    ]
+    constructor = Mock(
+        return_value=SimpleNamespace(
+            quant_method=SimpleNamespace(
+                kernel=object() if fallback == "new_kernel" else kernel
+            )
+        )
+    )
+    monkeypatch.setattr(dspark, "MergedColumnParallelLinear", constructor)
+
+    result = dspark._make_sm80_context_kv_proj(config, layers, fallback == "sp")
+
+    if fallback == "new_kernel":
+        assert result is None
+        constructor.assert_called_once()
+    elif fallback is not None:
+        assert result is None
+        constructor.assert_not_called()
+    else:
+        assert result is constructor.return_value
+        constructor.assert_called_once_with(
+            5120,
+            [512, 512, 512],
+            bias=False,
+            return_bias=False,
+            quant_config=config.quant_config,
+            prefix=projections[0].prefix,
+            disable_tp=True,
+        )
+
+
+def _make_v41_context_loader(monkeypatch, rank, scale_dtype):
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.models.deepseek_v4_1.nvidia import dspark
+    from vllm.models.deepseek_v4_1.quant_config import DeepseekV4FP8Config
+
+    for module in (linear, parameter, dspark):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 8)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank)
+    kernel = Mock()
+    kernel.input_quant_key.return_value = None
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.modelopt.init_mxfp8_linear_kernel",
+        lambda **kwargs: kernel,
+    )
+    monkeypatch.setattr(
+        dspark, "fused_moe_make_expert_params_mapping", lambda *a, **kw: []
+    )
+    quant = DeepseekV4FP8Config(
+        is_checkpoint_fp8_serialized=True, weight_block_size=[32, 32]
+    )
+    draft = dspark.DSparkDeepseekV4ForCausalLM.__new__(
+        dspark.DSparkDeepseekV4ForCausalLM
+    )
+    nn.Module.__init__(draft)
+    draft.config = SimpleNamespace(num_attention_heads=8, n_routed_experts=1)
+    draft.quant_config = quant
+    draft.linear_scale_name = "weight_scale"
+    draft.pad_shared_expert = False
+    draft.model = nn.Module()
+    draft.model.confidence_head = None
+    draft.model.layers = nn.ModuleList()
+    for i in range(3):
+        layer = nn.Module()
+        layer.ffn = SimpleNamespace(use_mega_moe=False)
+        layer.attn = nn.Module()
+        layer.attn.fused_wqa_wkv = linear.MergedColumnParallelLinear(
+            64, [32, 32], bias=False, quant_config=quant, disable_tp=True
+        )
+        draft.model.layers.append(layer)
+    draft.model.context_kv_proj = linear.MergedColumnParallelLinear(
+        64, [32] * 3, bias=False, return_bias=False, quant_config=quant, disable_tp=True
+    )
+    monkeypatch.setattr(draft, "process_weights_after_loading", lambda: None)
+    weights = []
+    for i in range(3):
+        for part, value in (("wq_a", -1), ("wkv", i + 1)):
+            weights.append(
+                (
+                    f"mtp.{i}.attn.{part}.weight",
+                    torch.full((32, 64), value, dtype=torch.float32).to(
+                        torch.float8_e4m3fn
+                    ),
+                )
+            )
+            base = 123 if part == "wq_a" else 127
+            scales = torch.tensor([[base + i, base + i + 1]], dtype=torch.uint8)
+            weights.append((f"mtp.{i}.attn.{part}.scale", scales.view(scale_dtype)))
+    return draft, weights
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("rank", [0, 7])
+@pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e8m0fnu])
+def test_v41_context_projection_loads_native_mxfp8_shards(
+    monkeypatch, default_vllm_config, rank, scale_dtype
+):
+    draft, weights = _make_v41_context_loader(monkeypatch, rank, scale_dtype)
+    source = {name: weight.clone() for name, weight in weights}
+    loaded = draft.load_weights(weights)
+
+    assert {
+        "model.context_kv_proj.weight",
+        "model.context_kv_proj.weight_scale",
+    } <= loaded
+    assert len(loaded) == 8  # Two params per original layer plus the two merged params.
+    context = draft.model.context_kv_proj
+    assert context.tp_rank == 0 and context.tp_size == 1
+    for i, layer in enumerate(draft.model.layers):
+        kv = source[f"mtp.{i}.attn.wkv.weight"]
+        scales = (
+            source[f"mtp.{i}.attn.wkv.scale"].view(torch.uint8).repeat_interleave(32, 0)
+        )
+        assert torch.equal(
+            context.weight[i * 32 : (i + 1) * 32].view(torch.uint8),
+            kv.view(torch.uint8),
+        )
+        assert torch.equal(context.weight_scale[i * 32 : (i + 1) * 32], scales)
+        original = layer.attn.fused_wqa_wkv
+        assert torch.equal(original.weight[32:].view(torch.uint8), kv.view(torch.uint8))
+        assert torch.equal(original.weight_scale[32:], scales)
+        q = source[f"mtp.{i}.attn.wq_a.weight"]
+        q_scales = (
+            source[f"mtp.{i}.attn.wq_a.scale"]
+            .view(torch.uint8)
+            .repeat_interleave(32, 0)
+        )
+        assert torch.equal(original.weight[:32].view(torch.uint8), q.view(torch.uint8))
+        assert torch.equal(original.weight_scale[:32], q_scales)
+    for name, weight in weights:
+        assert torch.equal(weight.view(torch.uint8), source[name].view(torch.uint8))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("missing", ["weight", "scale"])
+def test_v41_context_projection_rejects_missing_layer_shards(
+    monkeypatch, default_vllm_config, missing
+):
+    draft, weights = _make_v41_context_loader(monkeypatch, 7, torch.uint8)
+    weights = [(name, w) for name, w in weights if name != f"mtp.2.attn.wkv.{missing}"]
+    with pytest.raises(
+        ValueError, match="Missing checkpoint shards for context_kv_proj"
+    ):
+        draft.load_weights(weights)
+
+
+@pytest.mark.cpu_test
+def test_v41_context_projection_rejects_unconfigured_checkpoint_layer(
+    monkeypatch, default_vllm_config
+):
+    draft, weights = _make_v41_context_loader(monkeypatch, 7, torch.uint8)
+    weights.append(("mtp.3.attn.wkv.weight", weights[2][1]))
+    with pytest.raises(ValueError, match="DSpark layer 3 is out of range"):
+        draft.load_weights(weights)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("mapping_mode", ["per_layer", "partial_none", "profiling"])
+def test_v41_context_projection_reuses_per_layer_norm_rope_cache(
+    monkeypatch, mapping_mode
+):
+    from vllm.models.deepseek_v4_1.nvidia import dspark
+
+    states = torch.arange(40, dtype=torch.float32).reshape(5, 8) / 40
+    positions = torch.tensor([0, 63, 64, 127, 128])
+    slots = [torch.tensor([i, -1, i + 2, -1, i + 4]) for i in (10, 20, 30)]
+    records = []
+    monkeypatch.setattr(
+        dspark,
+        "_insert_context_kv",
+        lambda attn, kv, pos, slot: records.append((attn, kv.clone(), pos, slot)),
+    )
+    weights = [
+        torch.arange(64, dtype=torch.float32).reshape(8, 8) / (10 + i) for i in range(3)
+    ]
+    query_projections = [
+        Mock(side_effect=lambda x, w=w: (x @ w.T, None)) for w in weights
+    ]
+    layers = [
+        SimpleNamespace(
+            attn=SimpleNamespace(
+                fused_wqa_wkv=projection,
+                q_lora_rank=4,
+                head_dim=4,
+                kv_norm=nn.RMSNorm(4, eps=1e-6),
+            )
+        )
+        for projection in query_projections
+    ]
+    model = SimpleNamespace(layers=layers, context_kv_proj=None)
+    mappings = None if mapping_mode == "profiling" else slots
+    if mapping_mode == "partial_none":
+        assert mappings is not None
+        mappings[1] = None
+    dspark.DSparkDeepseekV4Model.precompute_and_store_context_kv(
+        model, states, positions, mappings
+    )
+    expected = list(records)
+    records.clear()
+    grouped_weight = torch.cat([w[4:] for w in weights])
+    grouped = Mock(side_effect=lambda x: x @ grouped_weight.T)
+    model.context_kv_proj = grouped
+    for projection in query_projections:
+        projection.reset_mock()
+    dspark.DSparkDeepseekV4Model.precompute_and_store_context_kv(
+        model, states, positions, mappings
+    )
+    grouped.assert_called_once_with(states)
+    for projection in query_projections:
+        projection.assert_not_called()
+    expected_count = {"per_layer": 3, "partial_none": 2, "profiling": 0}[mapping_mode]
+    assert len(records) == len(expected) == expected_count
+    for actual, reference in zip(records, expected):
+        assert actual[0] is reference[0]
+        torch.testing.assert_close(actual[1], reference[1])
+        assert actual[2] is reference[2] is positions
+        assert actual[3] is reference[3]

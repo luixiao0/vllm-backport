@@ -1,0 +1,12 @@
+ARG BASE_IMAGE=vllm-sm80-combined:git-156c4c51b4bb
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION=development
+LABEL org.opencontainers.image.source="https://github.com/luixiao0/vllm-backport" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}"
+COPY vllm/envs.py \
+     vllm/models/deepseek_v4_1/nvidia/dspark.py \
+     vllm/v1/worker/gpu/spec_decode/dflash/cudagraph.py /opt/sm80-decode/source/
+COPY tools/sm80/install-dspark-decode.py /opt/sm80-decode/
+RUN CUDA_VISIBLE_DEVICES="" SM80_SOURCE_REVISION="${SOURCE_REVISION}" \
+    uv run --no-project python3 /opt/sm80-decode/install-dspark-decode.py
+COPY benchmarks/kernels/benchmark_dsv41_dspark_context.py /opt/sm80-probes/

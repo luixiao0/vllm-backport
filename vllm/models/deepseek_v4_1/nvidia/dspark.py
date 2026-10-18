@@ -24,6 +24,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear.mxfp8.marlin import MarlinMxfp8LinearKernel
 from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_post_tilelang,
 )
@@ -32,7 +33,10 @@ from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -49,6 +53,7 @@ from vllm.models.common.ops.sequence_parallel import (
     sp_padding_mask,
     sp_shard,
 )
+from vllm.platforms import current_platform
 
 from .model import (
     DeepseekV4DecoderLayer,
@@ -63,6 +68,49 @@ logger = init_logger(__name__)
 # MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
 # fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
+
+
+def _make_sm80_context_kv_proj(
+    vllm_config: VllmConfig, layers: nn.ModuleList, use_sequence_parallel: bool
+) -> MergedColumnParallelLinear | None:
+    if not envs.VLLM_DSV41_DSPARK_CONTEXT_KV:
+        return None
+    quant_config = vllm_config.quant_config
+    if (
+        use_sequence_parallel
+        or getattr(vllm_config, "lora_config", None) is not None
+        or not current_platform.is_cuda()
+        or not current_platform.is_device_capability(80)
+        or getattr(quant_config, "weight_block_size", None) != [32, 32]
+        or not getattr(quant_config, "is_scale_e8m0", False)
+        or len(layers) != 3
+    ):
+        return None
+    projections = [layer.attn.fused_wqa_wkv for layer in layers]
+    if any(
+        proj.input_size != 5120
+        or proj.output_sizes != [1280, 512]
+        or not proj.disable_tp
+        or not isinstance(
+            getattr(proj.quant_method, "kernel", None), MarlinMxfp8LinearKernel
+        )
+        for proj in projections
+    ):
+        return None
+    context_kv_proj = MergedColumnParallelLinear(
+        5120,
+        [512] * len(layers),
+        bias=False,
+        return_bias=False,
+        quant_config=quant_config,
+        prefix=projections[0].prefix,
+        disable_tp=True,
+    )
+    if not isinstance(
+        getattr(context_kv_proj.quant_method, "kernel", None), MarlinMxfp8LinearKernel
+    ):
+        return None
+    return context_kv_proj
 
 
 class DSparkDeepseekV4Model(nn.Module):
@@ -119,6 +167,9 @@ class DSparkDeepseekV4Model(nn.Module):
                 for i in range(self.num_dspark_layers)
             ]
         )
+        self.context_kv_proj = _make_sm80_context_kv_proj(
+            vllm_config, self.layers, self.use_sequence_parallel
+        )
 
         # Heads: final norm, and the Markov + confidence heads.
         # Loaded from the "final" MTP layer weights (mtp.*) in the target
@@ -171,15 +222,19 @@ class DSparkDeepseekV4Model(nn.Module):
         place draft layers in different groups). ``None`` (or a ``None`` entry)
         runs the projection to reserve workspace but writes nothing (profiling).
         """
+        all_kv = (
+            self.context_kv_proj(main_x) if self.context_kv_proj is not None else None
+        )
         for i, layer in enumerate(self.layers):
             slot_mapping = (
                 None if context_slot_mappings is None else context_slot_mappings[i]
             )
             attn = layer.attn
-            # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv projection
-            # (q_lora part discarded), then RoPE/quant/insert via the fused op.
-            qr_kv, _ = attn.fused_wqa_wkv(main_x)
-            kv = qr_kv[..., attn.q_lora_rank :]
+            if all_kv is None:
+                qr_kv, _ = attn.fused_wqa_wkv(main_x)
+                kv = qr_kv[..., attn.q_lora_rank :]
+            else:
+                kv = all_kv[..., i * attn.head_dim : (i + 1) * attn.head_dim]
             kv = attn.kv_norm(kv)
             if slot_mapping is None:
                 continue
@@ -446,6 +501,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         loaded_confidence_head = False
+        context_kv_proj = getattr(self.model, "context_kv_proj", None)
+        context_shards: dict[str, set[int]] = {}
 
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
@@ -469,6 +526,22 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     else f".{self.linear_scale_name}"
                 )
                 name = name.removesuffix(".scale") + suffix
+            if context_kv_proj is not None:
+                context_match = re.fullmatch(
+                    r"model\.layers\.(\d+)\.attn\.wkv\.(weight|weight_scale)", name
+                )
+                if context_match is not None:
+                    layer_idx = int(context_match.group(1))
+                    if layer_idx >= len(self.model.layers):
+                        raise ValueError(
+                            f"Checkpoint DSpark layer {layer_idx} is out of range"
+                        )
+                    suffix = context_match.group(2)
+                    context_name = f"model.context_kv_proj.{suffix}"
+                    context_param = params_dict[context_name]
+                    context_param.weight_loader(context_param, loaded_weight, layer_idx)
+                    loaded_params.add(context_name)
+                    context_shards.setdefault(suffix, set()).add(layer_idx)
             if ".shared_experts.w2" in name:
                 name = name.replace(".shared_experts.w2", ".shared_experts.down_proj")
             if self.pad_shared_expert and ".shared_experts." in name:
@@ -528,6 +601,13 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        if context_kv_proj is not None:
+            expected_shards = set(range(len(self.model.layers)))
+            for param_name, _ in context_kv_proj.named_parameters():
+                if context_shards.get(param_name) != expected_shards:
+                    raise ValueError(
+                        f"Missing checkpoint shards for context_kv_proj.{param_name}"
+                    )
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
         self.process_weights_after_loading()
