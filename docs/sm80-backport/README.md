@@ -4,8 +4,10 @@ This fork targets A100 serving, beginning with DeepSeek V4.1 and DSpark.
 The first kernel project is a
 [length-aware candidate selector](candidate-selection.md) inspired by upstream
 vLLM #61039. Its SM100 DeepSelect implementation cannot run directly on SM80.
-An opt-in score-kernel prototype is available; GPU correctness and performance
-validation are pending. There is no validated runtime release from this fork yet.
+An opt-in score-kernel prototype is available. Bounded shared-A100 correctness
+probes passed; full-suite, isolated performance, serving, and model-quality
+validation remain pending. There is no validated runtime release from this fork
+yet.
 
 ## Branches and provenance
 

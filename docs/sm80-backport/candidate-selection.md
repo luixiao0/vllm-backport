@@ -70,6 +70,16 @@ build, publish an image, or start a model server.
   reservation 28 MiB, plus CUDA context overhead. The probe used a 256 MiB
   allocator cap, exposed one GPU only, and exited without changing the existing
   service. This was not the full pytest module or a serving test.
+- A second bounded shared-A100 probe checked allocated width 278528, block size
+  8, top-k 2048, rows 1/6/48, and contexts 8192/32768/131072/278528. All 12 FP32
+  configurations matched baseline scores and candidate IDs exactly during graph
+  replay; multi-row cases included an empty row and reused graphs across changing
+  bounds. The probe completed in 12.94 seconds, with 67.9 MiB peak tensor
+  allocation and 120 MiB reservation, plus CUDA context overhead. Four alternating
+  A/B event samples per path showed no compelling complete-selector benefit.
+  The first baseline score sample in each configuration was an outlier around
+  2.3 ms. Keep those raw samples; these timings cannot establish a speedup or
+  regression on a shared GPU. No profiler or cache-flushing loop was used.
 - Full GPU-suite execution, isolated kernel timings, serving A/B, and model
   quality evaluation remain pending. Shared-GPU probes establish no speedup and
   provide no basis for changing the default.
