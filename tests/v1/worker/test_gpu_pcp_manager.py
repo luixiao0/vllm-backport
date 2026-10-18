@@ -193,6 +193,8 @@ def test_partition_defers_dcp_metadata_to_post_partition_batch():
 
     local_batch = manager.partition_batch(global_batch, padded_num_tokens=2)
 
+    assert not local_batch.has_prefill and local_batch.decode_graph_eligible
+    assert local_batch.prefill_runs_as_decode_np is None
     assert local_batch.dcp_local_seq_lens is None
     assert local_batch.seq_lens.tolist() == [17, 25]
 

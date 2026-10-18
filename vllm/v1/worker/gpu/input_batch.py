@@ -84,6 +84,8 @@ class InputBatch:
     is_prefilling_np: np.ndarray
     # == np.any(is_prefilling_np)
     has_prefill: bool
+    # No prefills, or only prefill rows that run as decodes.
+    decode_graph_eligible: bool
 
     # [num_tokens_after_padding]
     input_ids: torch.Tensor
@@ -108,6 +110,10 @@ class InputBatch:
     # a query length this batch's own split does not reach, so attention metadata
     # stays valid for every replay the graph serves.
     max_query_len: int | None = None
+
+    # Prefill rows scheduling one new prompt token over existing context.
+    # None if there are no prefills or PCP partitions the prefill rows.
+    prefill_runs_as_decode_np: np.ndarray | None = None
 
     @classmethod
     def make_dummy(
@@ -191,6 +197,7 @@ class InputBatch:
             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
             is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
             has_prefill=False,
+            decode_graph_eligible=True,
             input_ids=input_ids,
             positions=positions,
             is_padding=is_padding,

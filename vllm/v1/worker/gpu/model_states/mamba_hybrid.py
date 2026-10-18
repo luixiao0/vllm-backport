@@ -281,10 +281,13 @@ class MambaHybridModelState(DefaultModelState):
         else:
             max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
 
+        is_prefilling_np = input_batch.is_prefilling_np
+        if input_batch.prefill_runs_as_decode_np is not None:
+            # A prompt tail the scheduler padded with placeholder drafts must run
+            # as a spec-decode row: the prefill kernels can't roll them back.
+            is_prefilling_np = is_prefilling_np & ~input_batch.prefill_runs_as_decode_np
         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
-        is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
-            input_batch.is_prefilling_np
-        )
+        is_prefilling[: input_batch.num_reqs] = torch.from_numpy(is_prefilling_np)
         # During CUDAGraph capture, num_decode_draft_tokens_cpu and num_accepted_tokens
         # are created by attn_metadata_builder.build_for_cudagraph_capture, so we only
         # compute them during actual (non-capture) forward execution.
@@ -301,11 +304,9 @@ class MambaHybridModelState(DefaultModelState):
             num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)
             num_draft_tokens_per_req = input_batch.num_draft_tokens_per_req
             if num_draft_tokens_per_req is not None:
-                # A row is a spec-decode row only when its whole prompt is already
-                # computed, i.e. exactly one non-draft (decode) token is scheduled.
-                is_decode = (
-                    input_batch.num_scheduled_tokens == num_draft_tokens_per_req + 1
-                )
+                # Adaptive verification can rewrite the scheduled query lengths.
+                # The adjusted request state also includes padded prompt tails.
+                is_decode = ~is_prefilling_np & (input_batch.num_scheduled_tokens > 0)
                 spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
                 num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
                     spec_decode_mask, num_draft_tokens_per_req, -1

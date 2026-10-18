@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -37,6 +38,7 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
         seq_lens_cpu_upper_bound=torch.tensor([1537], dtype=torch.int32),
         seq_lens=torch.tensor([1537], dtype=torch.int32),
         is_prefilling_np=torch.tensor([False]).numpy(),
+        prefill_runs_as_decode_np=None,
         dcp_local_seq_lens=None,
         positions=positions,
         prompt_lens=torch.tensor([1024], dtype=torch.int32),
@@ -56,6 +58,44 @@ def test_prepare_attn_forwards_positions(monkeypatch: pytest.MonkeyPatch) -> Non
 
     assert metadata is expected_metadata
     assert build_attn_metadata.call_args.kwargs["positions"] is positions
+
+
+@pytest.mark.parametrize("query_lens", [[4, 4, 4], [2, 2, 4]])
+def test_prompt_tail_metadata_uses_decode_state_with_placeholder_drafts(
+    monkeypatch, query_lens
+):
+    """Padded tails and adaptive verify rows must retain rollback draft counts."""
+    state = object.__new__(MambaHybridModelState)
+    state.vllm_config = SimpleNamespace(num_speculative_tokens=3)
+    state.max_model_len = 8192
+    state._align_mode = False
+    state.recoverssm = None
+    state.num_accepted_tokens_gpu = torch.ones(3, dtype=torch.int32)
+    input_batch = SimpleNamespace(
+        num_reqs=3,
+        num_tokens=sum(query_lens),
+        num_reqs_after_padding=3,
+        num_tokens_after_padding=sum(query_lens),
+        idx_mapping=torch.arange(3),
+        query_start_loc_np=np.array([0, *np.cumsum(query_lens)], dtype=np.int32),
+        query_start_loc=torch.tensor([0, *np.cumsum(query_lens)], dtype=torch.int32),
+        num_scheduled_tokens=np.array(query_lens, dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([44, 132, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([44, 132, 4], dtype=torch.int32),
+        is_prefilling_np=np.array([False, True, True]),
+        prefill_runs_as_decode_np=np.array([False, True, False]),
+        num_draft_tokens_per_req=np.array([3, 3, 3], dtype=np.int32),
+        dcp_local_seq_lens=None,
+        positions=torch.zeros(sum(query_lens), dtype=torch.int64),
+        prompt_lens=None,
+    )
+    build = Mock(return_value={})
+    monkeypatch.setattr(mamba_hybrid, "build_attn_metadata", build)
+    state.prepare_attn(input_batch, CUDAGraphMode.NONE, (), torch.empty(0), [], Mock())
+    metadata = build.call_args.kwargs["model_specific_attn_metadata"]
+    assert metadata.is_prefilling.tolist() == [False, False, True]
+    assert metadata.num_decode_draft_tokens_cpu.tolist() == [3, 3, -1]
+    assert input_batch.is_prefilling_np.tolist() == [False, True, True]
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")

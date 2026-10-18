@@ -204,6 +204,25 @@ def test_microbatches_do_not_share_buffers():
     torch.testing.assert_close(first.seq_lens, first_seq_lens)
 
 
+def test_microbatches_slice_prompt_tail_mask():
+    buffers = _make_buffers()
+    batch = _make_input_batch([1] * 6, [128] * 6, buffers)
+    mask = np.array([False, True, False, True, False, True])
+    batch = replace(
+        batch,
+        is_prefilling_np=mask.copy(),
+        has_prefill=True,
+        prefill_runs_as_decode_np=mask,
+        decode_graph_eligible=True,
+    )
+    for i, ubatch_slice in enumerate(create_ubatch_slices(batch, num_ubatches=2)):
+        sliced = _slice_input_batch(batch, ubatch_slice, *_make_ubatch_buffers()[i])
+        np.testing.assert_array_equal(
+            sliced.prefill_runs_as_decode_np, mask[i * 3 : i * 3 + 3]
+        )
+        assert sliced.has_prefill and sliced.decode_graph_eligible
+
+
 def test_trailing_microbatch_absorbs_cudagraph_padding():
     """The padded microbatch keeps padded rows empty and query_start_loc flat."""
     query_lens, seq_lens = [1] * 6, [64] * 6
