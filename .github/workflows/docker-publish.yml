@@ -18,6 +18,7 @@ concurrency:
 
 jobs:
   cancel-stale:
+    if: github.repository == 'wtdcode/vllm-backport'
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -37,6 +38,7 @@ jobs:
           done
 
   build-and-push:
+    if: github.repository == 'wtdcode/vllm-backport'
     # On a repo with a self-hosted builder, set the repo variable
     # BUILD_RUNNER (e.g. "self-hosted"); GitHub-hosted otherwise.
     runs-on: self-hosted

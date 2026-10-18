@@ -1,5 +1,10 @@
 # vLLM Backport
 
+> This fork's A100 development branch is `sm80`. See the
+> [SM80 development guide](docs/sm80-backport/README.md) for its baseline,
+> build command, and first port. The images listed below are upstream images;
+> this fork has not published or validated a new runtime image yet.
+
 A vLLM fork that focuses on running frontier models on older cards like A6000, 3090 and A100.
 
 Status:
