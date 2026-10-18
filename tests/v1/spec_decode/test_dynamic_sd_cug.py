@@ -17,6 +17,7 @@ from vllm.config import (
 )
 from vllm.v1.worker.gpu import cudagraph_utils as gpu_cudagraph_utils
 from vllm.v1.worker.gpu import dp_utils
+from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
 pytestmark = pytest.mark.cpu_test
@@ -134,6 +135,163 @@ def _create_vllm_config_for_dsd(
     vllm_config.speculative_config = speculative_config
 
     return vllm_config
+
+
+@pytest.mark.parametrize("query_len", [5, 6])
+@pytest.mark.parametrize("dynamic_verification", [False, True])
+def test_parallel_draft_graphs_cover_small_request_batches(
+    monkeypatch, query_len, dynamic_verification
+):
+    """Target K+1 buckets must not pad DSpark C1 or leave C8 running eagerly."""
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    config = _create_vllm_config_for_dsd(8, 5, use_dynamic_sd=dynamic_verification)
+    grid = [6, 12, 24, 48, 96, 192, 384]
+    config.compilation_config.cudagraph_capture_sizes = grid
+    config.compilation_config.max_cudagraph_capture_size = 384
+    config.parallel_config.data_parallel_size = 2
+    config.parallel_config.tensor_parallel_size = 8
+    manager = DFlashCudaGraphManager(
+        config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=query_len,
+        lora_capture_cases=[0, 1],
+    )
+    manager._graphs_captured = True
+    for num_reqs in range(1, 9):
+        for num_loras in (0, 1):
+            desc = manager.dispatch(
+                num_reqs, num_reqs * query_len, query_len, num_active_loras=num_loras
+            )
+            assert desc.cg_mode == CUDAGraphMode.FULL
+            assert desc.num_tokens == num_reqs * query_len
+            assert desc.num_reqs == num_reqs
+            assert desc.num_active_loras == num_loras
+    assert manager.dp_size == 2 and manager.tp_size == 8
+    assert config.compilation_config.cudagraph_capture_sizes is grid
+    assert config.compilation_config.max_cudagraph_capture_size == 384
+    assert config.speculative_config is not None
+
+
+@pytest.mark.parametrize("capture_sizes", [[], [10, 40]])
+def test_parallel_draft_graphs_respect_explicit_capture_sizes(
+    monkeypatch, capture_sizes
+):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    manager = DFlashCudaGraphManager(
+        _create_vllm_config_for_dsd(8, 5, use_dynamic_sd=False),
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=5,
+        capture_sizes=capture_sizes,
+    )
+    manager._graphs_captured = True
+    assert manager.compilation_config.cudagraph_capture_sizes == capture_sizes
+    desc = manager.dispatch(1, 5, 5, num_active_loras=0)
+    assert desc.cg_mode == (CUDAGraphMode.FULL if capture_sizes else CUDAGraphMode.NONE)
+    if capture_sizes:
+        assert desc.num_tokens == 10
+
+
+@pytest.mark.parametrize(("max_tokens", "max_reqs"), [(21, 8), (16384, 4)])
+def test_parallel_draft_graphs_reject_override_beyond_buffers(max_tokens, max_reqs):
+    config = _create_vllm_config_for_dsd(8, 5, use_dynamic_sd=False)
+    config.scheduler_config.max_num_batched_tokens = max_tokens
+    config.scheduler_config.max_num_seqs = max_reqs
+    with pytest.raises(ValueError, match="draft buffer capacity"):
+        DFlashCudaGraphManager(
+            config,
+            torch.device("cpu"),
+            CUDAGraphMode.FULL_DECODE_ONLY,
+            decode_query_len=5,
+            capture_sizes=[40],
+        )
+
+
+def test_parallel_draft_graphs_respect_target_capture_capacity(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    config = _create_vllm_config_for_dsd(8, 5, use_dynamic_sd=False)
+    config.compilation_config.cudagraph_capture_sizes = [6, 12]
+    config.compilation_config.max_cudagraph_capture_size = 12
+    manager = DFlashCudaGraphManager(
+        config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=5,
+    )
+    manager._graphs_captured = True
+    assert manager.dispatch(2, 10, 5, 0).cg_mode == CUDAGraphMode.FULL
+    assert manager.dispatch(3, 15, 5, 0).cg_mode == CUDAGraphMode.NONE
+
+
+def test_parallel_draft_graphs_keep_large_request_grids_sparse(monkeypatch):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    config = _create_vllm_config_for_dsd(128, 5, use_dynamic_sd=False)
+    config.compilation_config.cudagraph_capture_sizes = [
+        6,
+        12,
+        24,
+        48,
+        96,
+        192,
+        384,
+        768,
+    ]
+    config.compilation_config.max_cudagraph_capture_size = 768
+    manager = DFlashCudaGraphManager(
+        config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=5,
+    )
+    manager._graphs_captured = True
+    assert len(manager.compilation_config.cudagraph_capture_sizes) < 32
+    assert manager.dispatch(128, 640, 5, 0).cg_mode == CUDAGraphMode.FULL
+
+
+@pytest.mark.parametrize("max_tokens", [21, 16384])
+def test_parallel_draft_graphs_keep_legacy_shapes_within_draft_budget(
+    monkeypatch, max_tokens
+):
+    monkeypatch.setattr(
+        gpu_cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    config = _create_vllm_config_for_dsd(128, 5, use_dynamic_sd=False)
+    config.compilation_config.cudagraph_capture_sizes = [6, 12, 24, 48, 376, 384]
+    config.compilation_config.max_cudagraph_capture_size = 384
+    config.scheduler_config.max_num_batched_tokens = max_tokens
+    manager = DFlashCudaGraphManager(
+        config,
+        torch.device("cpu"),
+        CUDAGraphMode.FULL_DECODE_ONLY,
+        decode_query_len=5,
+    )
+    manager._graphs_captured = True
+    if max_tokens == 21:
+        assert manager.dispatch(4, 20, 5, 0).cg_mode == CUDAGraphMode.FULL
+        assert manager.dispatch(5, 25, 5, 0).cg_mode == CUDAGraphMode.NONE
+    else:
+        desc = manager.dispatch(76, 380, 5, 0)
+        assert desc.cg_mode == CUDAGraphMode.FULL
+        assert desc.num_tokens == 380 and desc.num_reqs == 76
 
 
 def test_dynamic_sd_full_cudagraph_covers_all_uniform_decode_shapes(monkeypatch):
