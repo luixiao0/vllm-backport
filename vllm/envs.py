@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
+    VLLM_SM80_MXFP8_BMM: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
@@ -1283,6 +1284,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # runs as a BF16 checkpoint (no per-step dequant). Set to 0 to fall back to
     # per-step dequant: keeps the 1-byte MXFP8 weights (~half the weight memory)
     # at the cost of dequantizing every forward step (much slower). Default on.
+    "VLLM_SM80_MXFP8_BMM": lambda: bool(int(os.getenv("VLLM_SM80_MXFP8_BMM", "0"))),
     "VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD": lambda: (
         os.getenv("VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD", "True").lower()
         in ("true", "1")

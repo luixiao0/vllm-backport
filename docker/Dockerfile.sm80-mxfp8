@@ -1,0 +1,13 @@
+# Experimental Python overlay on the source-verified radix development image.
+ARG BASE_IMAGE=vllm-sm80-radix:git-20b2ff96f8e4
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.source="https://github.com/luixiao0/vllm-backport"
+LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
+COPY vllm/envs.py /tmp/sm80-mxfp8/envs.py
+COPY vllm/model_executor/kernels/linear/__init__.py /tmp/sm80-mxfp8/linear_init.py
+COPY vllm/model_executor/kernels/linear/mxfp8/sm80.py /tmp/sm80-mxfp8/sm80.py
+COPY vllm/models/deepseek_v4_1/ampere/ampere_sparse.py /tmp/sm80-mxfp8/ampere_sparse.py
+COPY tools/sm80/install-mxfp8-overlay.py /tmp/sm80-mxfp8/install.py
+RUN CUDA_VISIBLE_DEVICES="" uv run --no-project python3 /tmp/sm80-mxfp8/install.py
+ENV VLLM_SM80_MXFP8_BMM=0

@@ -129,6 +129,7 @@ from vllm.model_executor.kernels.linear.mxfp8.marlin import (
 from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
     RocmDotScaledMxfp8LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mxfp8.sm80 import Sm80Mxfp8BmmLinearKernel
 from vllm.model_executor.kernels.linear.mxfp8.xpu import (
     XPUMxFp8LinearKernel,
 )
@@ -298,6 +299,7 @@ _LINEAR_BACKEND_KERNEL_MAP: dict[str, set[type]] = {
         MarlinMxFp4LinearKernel,
     },
     "triton": {
+        Sm80Mxfp8BmmLinearKernel,
         TritonInt8ScaledMMLinearKernel,
         TritonFp8BlockScaledMMKernel,
         TritonW4A16LinearKernel,
@@ -864,7 +866,11 @@ def init_mxfp8_linear_kernel(*, bmm_batch_size: int | None = None) -> Mxfp8Linea
     possible: list[type[Mxfp8LinearKernel]]
     if bmm_batch_size is not None:
         possible = (
-            [DeepGemmMxfp8BmmLinearKernel, EmulationMxfp8LinearKernel]
+            [
+                DeepGemmMxfp8BmmLinearKernel,
+                Sm80Mxfp8BmmLinearKernel,
+                EmulationMxfp8LinearKernel,
+            ]
             if current_platform.is_cuda()
             else []
         )

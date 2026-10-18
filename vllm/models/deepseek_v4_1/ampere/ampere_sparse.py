@@ -10,6 +10,8 @@ fused aiter norm+quant self-disable off ROCm), and
 where Triton refuses native fp8 converts.
 """
 
+import torch
+
 from vllm.models.deepseek_v4_1.amd.rocm import (
     DeepseekV4ROCMAiterMLASparseBackend,
     DeepseekV41ROCMAiterMLAAttention,
@@ -42,3 +44,16 @@ class DeepseekV41AmpereMLAAttention(DeepseekV41ROCMAiterMLAAttention):
         # which dequantizes wo_a to a plain bf16 [g*r, d] weight at load time;
         # _get_cached_wo_a_bf16 then only views it (no second dequant).
         self.wo_a.is_bmm = True
+
+    def _o_proj(self, o, positions):
+        kernel = getattr(self.wo_a, "_sm80_mxfp8_bmm", None)
+        if kernel is None or o.dtype != torch.bfloat16:
+            return super()._o_proj(o, positions)
+        z = kernel.apply_with_inverse_rope(
+            self.wo_a,
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.rope_head_dim,
+        )
+        return self.wo_b(z.flatten(1))
