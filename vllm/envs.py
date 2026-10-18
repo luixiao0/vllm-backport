@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES: bool = False
+    VLLM_DSV4_CANDIDATE_SELECTION_BACKEND: Literal["torch", "triton_radix"] = "torch"
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
@@ -2303,6 +2304,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # valid context. Keep the full score layout and torch.topk tie behavior.
     "VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES": lambda: (
         os.environ.get("VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES", "0") == "1"
+    ),
+    # Device-length-aware selection with no full-width sort. Opt-in until
+    # serving and model-quality validation is complete.
+    "VLLM_DSV4_CANDIDATE_SELECTION_BACKEND": env_with_choices(
+        "VLLM_DSV4_CANDIDATE_SELECTION_BACKEND", "torch", ["torch", "triton_radix"]
     ),
     # Row-chunk the SM80/SM86 sparse-indexer prefill logits (allover326's
     # long-context fix from #50576): compute the [M, N] fp32 logits transient

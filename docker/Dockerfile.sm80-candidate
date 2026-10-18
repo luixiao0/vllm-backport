@@ -4,42 +4,12 @@ FROM ${BASE_IMAGE}
 ARG SOURCE_REVISION=unknown
 LABEL org.opencontainers.image.source="https://github.com/luixiao0/vllm-backport"
 LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
-LABEL org.opencontainers.image.description="Experimental candidate-score overlay; GPU validation pending"
+LABEL org.opencontainers.image.description="Experimental SM80 candidate-selection overlay; serving validation pending"
 
 COPY vllm/envs.py /tmp/sm80-candidate/envs.py
 COPY vllm/model_executor/kernels/attention/dsa/candidate_blocks.py /tmp/sm80-candidate/candidate_blocks.py
-RUN CUDA_VISIBLE_DEVICES="" uv run --no-project python3 - <<'PY'
-import hashlib
-import importlib.metadata as md
-import importlib.util
-import json
-import pathlib
-import py_compile
-import shutil
-
-root = pathlib.Path(importlib.util.find_spec("vllm").origin).parent
-updates = {
-    "envs.py": ("envs.py", "eafe500bb45c7327399673553537353ce3b9c22badf07cf07c7e258eb88272d2"),
-    "model_executor/kernels/attention/dsa/candidate_blocks.py": (
-        "candidate_blocks.py", "0d53e4e6a60a37995713bf792089d645b07db1af3e55e36dcc49542705a5db9c"
-    ),
-}
-# Check every preimage before replacing either file.
-for relative, (_, expected) in updates.items():
-    actual = hashlib.sha256((root / relative).read_bytes()).hexdigest()
-    if actual != expected:
-        raise RuntimeError(f"Unsupported base source for {relative}: {actual}")
-hashes = {}
-for relative, (source, _) in updates.items():
-    target = root / relative
-    shutil.copyfile(pathlib.Path("/tmp/sm80-candidate") / source, target)
-    py_compile.compile(str(target), doraise=True)
-    hashes[relative] = hashlib.sha256(target.read_bytes()).hexdigest()
-pathlib.Path("/opt/sm80-candidate.json").write_text(json.dumps({
-    "files": hashes,
-    "versions": {p: md.version(p) for p in ["vllm", "torch", "triton", "flashinfer-python"]},
-    "gpu_validation": "pending",
-}, indent=2) + "\n")
-shutil.rmtree("/tmp/sm80-candidate")
-PY
+COPY vllm/model_executor/kernels/attention/dsa/candidate_radix.py /tmp/sm80-candidate/candidate_radix.py
+COPY tools/sm80/install-candidate-overlay.py /tmp/sm80-candidate/install.py
+RUN CUDA_VISIBLE_DEVICES="" uv run --no-project python3 /tmp/sm80-candidate/install.py
 ENV VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES=0
+ENV VLLM_DSV4_CANDIDATE_SELECTION_BACKEND=torch

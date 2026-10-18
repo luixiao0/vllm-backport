@@ -11,6 +11,7 @@ from vllm import envs
 from vllm.config import CUDAGraphMode
 from vllm.models.deepseek_v32 import attention as deepseek_v32_attention
 from vllm.models.deepseek_v32.attention import DeepseekV32Attention
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
@@ -441,3 +442,82 @@ def test_candidate_length_aware_scores_replay_changing_bounds(monkeypatch, dtype
             logits, starts, ends, k, block_size, expected, row_repeat=2
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not current_platform.is_cuda()
+    or not current_platform.has_device_capability(80),
+    reason="CUDA SM80+ required",
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "width,block_size,k", [(97, 3, 7), (8193, 8, 33), (278528, 8, 2048)]
+)
+@pytest.mark.parametrize("decode", [False, True])
+def test_candidate_radix_preserves_membership_and_mask(
+    monkeypatch, dtype, width, block_size, k, decode
+):
+    """Changing lengths, NaNs and boundary ties must preserve the consumer mask."""
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        apply_candidate_mask,
+        select_candidate_blocks,
+    )
+
+    torch.manual_seed(73)
+    rows = 6
+    repeat = 2 if decode else 1
+    logits = torch.randn(rows, width * 2, device="cuda", dtype=dtype)[:, ::2]
+    logits[0].fill_(0)
+    logits[1, ::17] = torch.nan
+    logits[2, ::11] = torch.inf
+    logits[3].fill_(-torch.inf)
+    logits[4].round_()
+    if dtype == torch.float32:
+        logits[5].copy_(torch.logspace(-30, 30, width, device="cuda"))
+    starts = (
+        None
+        if decode
+        else torch.tensor(
+            [0, 3, width - 1], device="cuda", dtype=torch.int64
+        ).repeat_interleave(2)
+    )
+    ends = torch.full((3 if decode else 6,), width, device="cuda", dtype=torch.int32)
+    backing = torch.full((rows, k * 2), -9, device="cuda", dtype=torch.int32)
+    actual = backing[:, ::2]
+    expected = torch.empty_like(actual)
+    monkeypatch.setattr(envs, "VLLM_DSV4_CANDIDATE_SELECTION_BACKEND", "triton_radix")
+    select_candidate_blocks(
+        logits, starts, ends, k, block_size, actual, row_repeat=repeat
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        select_candidate_blocks(
+            logits, starts, ends, k, block_size, actual, row_repeat=repeat
+        )
+    for bounds in ([0, 3, width - 1], [1, 5, width + 3], [width, width, width]):
+        bound_tensor = torch.tensor(bounds, dtype=ends.dtype, device="cuda")
+        ends.copy_(bound_tensor if decode else bound_tensor.repeat_interleave(2))
+        graph.replay()
+        monkeypatch.setattr(envs, "VLLM_DSV4_CANDIDATE_SELECTION_BACKEND", "torch")
+        select_candidate_blocks(
+            logits, starts, ends, k, block_size, expected, row_repeat=repeat
+        )
+        # Candidate order is discarded by the membership-mask consumer.
+        torch.testing.assert_close(
+            actual.sort(1).values, expected.sort(1).values, rtol=0, atol=0
+        )
+        assert (backing[:, 1::2] == -9).all()
+        masked = logits.clone()
+        reference = logits.clone()
+        apply_candidate_mask(
+            masked, starts, ends, actual, block_size, row_repeat=repeat
+        )
+        apply_candidate_mask(
+            reference, starts, ends, expected, block_size, row_repeat=repeat
+        )
+        torch.testing.assert_close(masked, reference, rtol=0, atol=0, equal_nan=True)
+    identical = actual.clone()
+    for _ in range(2):
+        graph.replay()
+        torch.testing.assert_close(actual, identical, rtol=0, atol=0)

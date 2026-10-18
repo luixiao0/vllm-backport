@@ -4,6 +4,10 @@ Status: experimental score-kernel prototype, disabled by default. The complete
 selector still uses full-width `torch.topk`; this is not a completed port of
 DeepSelect or a validated serving optimization.
 
+This page describes the first score-only prototype. The complete experimental
+[SM80 radix selector](candidate-radix.md) now has its own backend and validation
+plan; it remains disabled by default as well.
+
 ## Running the prototype
 
 Set `VLLM_DSV4_LENGTH_AWARE_CANDIDATE_SCORES=1` before starting the test process.

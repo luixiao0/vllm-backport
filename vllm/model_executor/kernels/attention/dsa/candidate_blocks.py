@@ -164,6 +164,21 @@ def select_candidate_blocks(
     if not width:
         out.fill_(-1)
         return
+    if (
+        envs.VLLM_DSV4_CANDIDATE_SELECTION_BACKEND == "triton_radix"
+        and topk_blocks > 0
+        and logits.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    ):
+        from vllm.model_executor.kernels.attention.dsa.candidate_radix import (
+            select_candidate_blocks_radix,
+        )
+        from vllm.platforms import current_platform
+
+        if current_platform.is_cuda() and current_platform.has_device_capability(80):
+            select_candidate_blocks_radix(
+                logits, row_ks, row_ke, topk_blocks, block_size, out, row_repeat
+            )
+            return
     nblocks = triton.cdiv(width, block_size)
     scores = logits.new_empty((rows, nblocks))
     _block_scores_kernel[(rows, triton.cdiv(nblocks, 128))](

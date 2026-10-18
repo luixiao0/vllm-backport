@@ -9,6 +9,11 @@ probes passed; full-suite, isolated performance, serving, and model-quality
 validation remain pending. There is no validated runtime release from this fork
 yet.
 
+A complete experimental backend replaces full-width `torch.topk` with an opt-in
+SM80-compatible [hierarchical radix selector](candidate-radix.md). It computes
+device-side lengths, parallel coarse histograms, and an exact boundary-bucket
+selection. This work must satisfy the same serving acceptance criteria.
+
 ## Branches and provenance
 
 - `master` follows `wtdcode/vllm-backport`; keep fork changes on `sm80` and
