@@ -46,7 +46,7 @@ versions and new source hashes in `/opt/sm80-candidate.json`, and leaves the fla
 off. It reuses the base's native extensions; it does not validate a full source
 build, publish an image, or start a model server.
 
-## Evidence available before GPU validation
+## Validation evidence
 
 - 60 CPU Triton-interpreter cases passed: FP32/FP16, packed and decode bounds,
   strides, repeated row metadata, empty and shortened contexts, ends beyond
@@ -63,9 +63,16 @@ build, publish an image, or start a model server.
 - The development overlay built successfully; a CPU-only smoke check verified
   both installed source hashes and the flag's default/off/on behavior. Its
   preimage guard also rejected an already modified base.
-- GPU unit tests, CUDA-graph execution, kernel timings, serving A/B, and model
-  quality evaluation remain pending an isolated allocation. There is no measured
-  A100 speedup and no basis for changing the default yet.
+- A later bounded probe on spare VRAM ran 13 extracted regression cases on
+  a shared A100 using the real installed module and env registry. Both flag
+  states, packed/decode bounds, empty rows, padding, and FP32/FP16/BF16 CUDA graph
+  replays with changing bounds passed. Peak PyTorch allocation was 9.5 MiB and
+  reservation 28 MiB, plus CUDA context overhead. The probe used a 256 MiB
+  allocator cap, exposed one GPU only, and exited without changing the existing
+  service. This was not the full pytest module or a serving test.
+- Full GPU-suite execution, isolated kernel timings, serving A/B, and model
+  quality evaluation remain pending. Shared-GPU probes establish no speedup and
+  provide no basis for changing the default.
 
 ## Problem and source
 
@@ -136,8 +143,8 @@ Run the relevant existing suite in the CUDA development environment:
   -q -k 'candidate or sparse_topk_remap'
 ```
 
-The GPU suite above remains pending; the CPU and compilation checks do not
-substitute for it.
+The full GPU suite above remains pending. The bounded shared-GPU probe used
+extracted regression bodies; it does not replace the complete test environment.
 
 ## Measurement and acceptance
 
@@ -159,5 +166,8 @@ microbenchmark number without a serving benefit is an experiment result, not
 a reason to change the default. If top-k is not a meaningful bottleneck at
 concurrency at most eight, record that result and reprioritize the next port.
 
-GPU measurements must use an isolated allocation. The currently serving A100
-container is not a benchmark harness; this bootstrap schedules no GPU work.
+Performance measurements require an isolated allocation. With the user's
+authorization, short correctness probes may use spare VRAM in a separate
+container with explicit allocation and runtime limits. Do not modify, stop, or
+restart the existing service, and do not treat shared-GPU timing as performance
+evidence. The serving container is not a test or benchmark harness.

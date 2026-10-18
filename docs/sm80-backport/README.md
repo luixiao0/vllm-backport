@@ -59,6 +59,12 @@ Our publishing destination and build runner will be configured separately.
 
 ## Validation and release
 
+Existing production deployments must not be changed as part of this work.
+On serving hosts, use read-only inspection or separate probes and tests. Short
+correctness probes may use spare VRAM with bounded allocation and runtime, but
+must not patch installed production files, change service configuration, or stop
+or restart any existing service. Shared-GPU timing is not performance evidence.
+
 Use the repository's `AGENTS.md`, kernel-writing guidance, and microbenchmark
 guidance. Run existing correctness tests before timing and extend the nearest
 suite for missing boundary cases. Put kernel benchmarks in `benchmarks/kernels/`.
