@@ -193,6 +193,93 @@ def test_fp8_candidate_paged_mqa_preserves_native_topk(
         assert torch.equal(actual, initial_indices)
 
 
+def test_fp8_candidate_mqa_reuses_jit_across_growing_host_bounds(monkeypatch):
+    """Growing mixed-batch bounds must neither JIT again nor round the clamp up."""
+    from triton import knobs
+
+    from vllm.model_executor.kernels.attention.dsa import candidate_mqa
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        apply_candidate_mask,
+    )
+
+    if current_platform.get_device_capability() != (8, 0):
+        pytest.skip("SM80 candidate port")
+    # The existing JIT monitor uses this real post-compile callback API.
+    assert hasattr(knobs.runtime, "jit_post_compile_hook")
+    device = "cuda"
+    rows, page_size = 6, 128
+    # Cross an alignment boundary without changing constexpr layout/ordering.
+    bounds = range(17005, 17010)
+    physical_length = bounds[-1] + 32
+    pages = cdiv(physical_length, page_size)
+    keys = torch.zeros(pages, page_size, 128, dtype=torch.bfloat16, device=device)
+    tail_start = bounds[0] // 8 * 8
+    keys.flatten(0, 1)[tail_start : tail_start + 32] = torch.arange(
+        1, 33, dtype=torch.bfloat16, device=device
+    )[:, None]
+    cache = _pack_paged_kv(keys)
+    q = torch.ones(rows, 1, 32, 128, device=device).to(torch.float8_e4m3fn)
+    weights = torch.ones(rows, 32, device=device)
+    table = torch.arange(pages, dtype=torch.int32, device=device).repeat(rows, 1)
+    lens = torch.tensor(
+        [0, 512, 513, 8192, physical_length - 16, physical_length],
+        dtype=torch.int32,
+        device=device,
+    )[:, None]
+    candidates = torch.arange(2048, dtype=torch.int32, device=device).repeat(rows, 1)
+    candidates[:, -8:] = tail_start // 8 + torch.arange(
+        8, dtype=torch.int32, device=device
+    )
+    actual = torch.empty(rows, 512, dtype=torch.int32, device=device)
+    expected = torch.empty_like(actual)
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+
+    def check_bound(bound):
+        # Clamp only the reference metadata: the candidate path must enforce
+        # the exact host bound itself, even when device lengths exceed it.
+        clamped_lens = lens.clamp(max=bound)
+        logits = fp8_paged_mqa_logits_triton(
+            q, cache, weights, clamped_lens, table, bound
+        )
+        apply_candidate_mask(logits, None, clamped_lens.reshape(-1), candidates, 8)
+        torch.ops._C.persistent_topk(
+            logits, clamped_lens.reshape(-1), expected, workspace, 512, bound
+        )
+        candidate_mqa.fp8_candidate_paged_mqa_topk(
+            q, cache, weights, lens, table, candidates, 8, actual, bound, workspace
+        )
+        assert torch.equal(actual, expected), (bound, actual, expected)
+        # Tail keys strictly increase: exposing even one rounded-up future
+        # position changes the selected set, while the newest valid one wins.
+        assert torch.all((actual[-2:] == bound - 1).any(dim=1))
+        assert torch.all(actual[-2:] < bound)
+
+    check_bound(bounds[0])
+    kernel_names = {
+        "_prepare_candidates",
+        "_candidate_paged_mqa",
+        "_restore_indices",
+    }
+    recompilations = []
+    previous_hook = knobs.runtime.jit_post_compile_hook
+
+    def record_compile(**kwargs):
+        name = getattr(kwargs.get("fn"), "name", None)
+        if name in kernel_names:
+            recompilations.append(name)
+        if previous_hook is not None:
+            return previous_hook(**kwargs)
+        return None
+
+    monkeypatch.setattr(knobs.runtime, "jit_post_compile_hook", record_compile)
+    for bound in bounds[1:]:
+        check_bound(bound)
+    assert not recompilations, (
+        "Changing only the host clamp bound compiled new candidate MQA kernels",
+        recompilations,
+    )
+
+
 def test_sparse_indexer_decode_dispatches_compact_only_for_eligible_consumers(
     monkeypatch,
 ):

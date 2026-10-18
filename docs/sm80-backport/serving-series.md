@@ -2,8 +2,9 @@
 
 This series preserves the official FP8/block-32 UE8M0 linear weights, FP4
 experts, existing FP8 indexer cache, and FP32 mHC coefficient arithmetic. It
-extends the existing Engram TP and SM80 radix-selector candidate. Production
-services and installed production files were not changed.
+extends the existing Engram TP and SM80 radix-selector candidate. The initial
+component screening left production services and installed production files
+unchanged. The later authorized maintenance A/B is recorded below.
 
 ## Candidate-only FP8 sparse MQA
 
@@ -135,9 +136,53 @@ one additional compact consumer in the long-context profile, and two overlapped
 mHC stages in both. The external harness enforces fresh 2 GiB free-VRAM admission
 and a 240-second timeout; the Torch allocator cap is 256 MiB.
 
-All GPU measurements used independent bounded containers and spare VRAM on a
-resident-production A100. They used short interleaved CUDA-event graph samples,
-without profiling, L2 flushing, clock changes, or production inference load.
-Model tokens/s and a full-model A/B were not measured. The tested source hashes,
-commands, raw results, and immutable candidate image are recorded in the task
-artifacts.
+The component measurements above used independent bounded containers and spare
+VRAM on a resident-production A100. They used short interleaved CUDA-event graph
+samples, without profiling, L2 flushing, clock changes, or production inference
+load. Those screens did not measure model tokens/s or a full-model A/B. The
+tested source hashes, commands, raw results, and immutable candidate image are
+recorded in the task artifacts.
+
+## Full-model maintenance validation, 2026-10-19
+
+The user subsequently authorized a service interruption for an exclusive
+maintenance A/B on the real 8x A100 deployment, using the official checkpoint.
+External business traffic was isolated for this comparison. These measurements
+are distinct from the earlier shared-GPU component screens, including the
+reported 24.2% component-boundary improvement; that number is not an end-to-end
+model result.
+
+For the old combined image's general profile, throughput changes relative to the
+original image were:
+
+| Prompt context | Concurrency | Cold throughput change | Warm throughput change |
+| --- | ---: | ---: | ---: |
+| 2K | 1 | +3.83% | +8.46% |
+| 2K | 8 | +0.37% | +2.49% |
+| 32K | 8 | +2.01% | -1.71% |
+| 128K | 1 | +2.14% | -2.11% |
+
+The results vary with workload and cache state; the general profile did not
+establish a uniform improvement. For the old combined long-context profile at
+128K context and concurrency 8, warm throughput increased from 506.626 to
+562.943 tokens/s (+11.11%). However, cold request duration regressed from
+157.069 to 373.307 seconds.
+
+The cold regression exposed runtime compilation that the fixed-bound component
+screens had missed. Mixed prefill/decode batches grow their host `max_seq_len`
+across steps, while all three sparse-MQA kernels treated `MAX_LEN` as
+`tl.constexpr`; rank 0 compiled 58 `_prepare_candidates` variants. The fix makes
+`MAX_LEN` a runtime scalar with `do_not_specialize=["MAX_LEN"]` in all three
+kernels, retaining the exact clamp rather than rounding the bound upward.
+The new GPU regression fails on the old image for recompilation and passes with
+the fix, alongside all 146 tests in the MQA logits suite. Growing bounds reuse
+the kernels and preserve native ordered top-k with the exact host clamp.
+**Full-model performance after this fix is pending and will be appended
+separately.** The
+old image's cold and warm results above must not be presented as post-fix
+measurements.
+
+Fifteen actual chat checks passed, but outputs were not bitwise identical. The
+synthetic performance benchmark fixes output length at 512 tokens; it is not a
+model-quality evaluation. Neither those chat checks nor the component-level
+bitwise checks establish full-model accuracy equivalence.

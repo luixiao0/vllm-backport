@@ -12,7 +12,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.mqa_logits_triton import _get_e4m3fn_bf16_lut
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_LEN"])
 def _prepare_candidates(
     candidates,
     lengths,
@@ -35,7 +35,7 @@ def _prepare_candidates(
     CAPACITY: tl.constexpr,
     CANDIDATE_SIZE: tl.constexpr,
     TOP_K: tl.constexpr,
-    MAX_LEN: tl.constexpr,
+    MAX_LEN,
     LENGTHS_2D: tl.constexpr,
     TILE: tl.constexpr,
 ):
@@ -103,7 +103,7 @@ def _prepare_candidates(
     tl.store(compact_lengths + row, compact_length)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_LEN"])
 def _candidate_paged_mqa(
     q,
     cache,
@@ -132,7 +132,7 @@ def _candidate_paged_mqa(
     CANDIDATE_SIZE: tl.constexpr,
     CAPACITY: tl.constexpr,
     TOP_K: tl.constexpr,
-    MAX_LEN: tl.constexpr,
+    MAX_LEN,
     LENGTHS_2D: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -214,7 +214,7 @@ def _candidate_paged_mqa(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["MAX_LEN"])
 def _restore_indices(
     compact_indices,
     logits,
@@ -229,7 +229,7 @@ def _restore_indices(
     CAPACITY: tl.constexpr,
     CANDIDATE_SIZE: tl.constexpr,
     TOP_K: tl.constexpr,
-    MAX_LEN: tl.constexpr,
+    MAX_LEN,
     LENGTHS_2D: tl.constexpr,
     DENSE_FILTERED: tl.constexpr,
     INPLACE: tl.constexpr,
@@ -324,6 +324,8 @@ def fp8_candidate_paged_mqa_topk(
     assert max_model_len < 2**30
     lengths_2d = context_lens.ndim == 2 and context_lens.shape[1] == next_n
     length_stride = context_lens.stride(1) if lengths_2d else 0
+    # Mixed prefill/decode bounds grow every step. Pass the exact clamp as a
+    # runtime scalar so changing host lengths reuse the compiled kernels.
     common = dict(
         NEXT_N=next_n,
         CAPACITY=capacity,
