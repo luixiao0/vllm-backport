@@ -2315,6 +2315,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSV41_SPARSE_MQA": lambda: (
         os.environ.get("VLLM_DSV41_SPARSE_MQA", "0") == "1"
     ),
+    # Shifted mHC coefficient overlap, screened only for small SM80 FULL graphs.
+    "VLLM_DSV41_MHC_OVERLAP": lambda: (
+        os.environ.get("VLLM_DSV41_MHC_OVERLAP", "0") == "1"
+    ),
     # Row-chunk the SM80/SM86 sparse-indexer prefill logits (allover326's
     # long-context fix from #50576): compute the [M, N] fp32 logits transient
     # in blocks of this many query rows instead of monolithically, bounding

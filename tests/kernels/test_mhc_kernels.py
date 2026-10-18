@@ -39,6 +39,61 @@ from vllm.utils.torch_utils import set_random_seed
 DEVICE = current_platform.device_type
 
 
+@pytest.mark.parametrize(
+    "tokens,mode,capturing,enabled",
+    [
+        (0, "FULL", True, False),
+        (1, "FULL", True, True),
+        (8, "FULL", True, True),
+        (9, "FULL", True, False),
+        (17, "FULL", True, False),
+        (6, "PIECEWISE", True, False),
+        (6, "NONE", False, False),
+        (6, "FULL", False, False),
+    ],
+)
+def test_mhc_overlap_rejects_unsafe_graph_boundaries(
+    tokens, mode, capturing, enabled, monkeypatch
+):
+    from vllm.config import CUDAGraphMode
+    from vllm.models.deepseek_v4_1.nvidia import mhc_overlap
+
+    monkeypatch.setattr(mhc_overlap, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        mhc_overlap,
+        "get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode[mode]),
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    assert mhc_overlap.use_mhc_overlap(object(), tokens) is enabled
+    assert not mhc_overlap.use_mhc_overlap(None, tokens)
+
+
+@pytest.mark.parametrize(
+    "unsupported", ["none", "arch", "hidden", "hc", "ubatch", "jit"]
+)
+def test_mhc_overlap_requires_screened_kernel_configuration(unsupported, monkeypatch):
+    from vllm.models.deepseek_v4_1.nvidia import mhc_overlap
+
+    monkeypatch.setattr(mhc_overlap.envs, "VLLM_DSV41_MHC_OVERLAP", True)
+    monkeypatch.setattr(
+        current_platform, "is_device_capability", lambda arch: unsupported != "arch"
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                hidden_size=5137 if unsupported == "hidden" else 5120,
+                hc_mult=8 if unsupported == "hc" else 4,
+            )
+        ),
+        parallel_config=SimpleNamespace(use_ubatching=unsupported == "ubatch"),
+        kernel_config=SimpleNamespace(enable_jit_warmup=unsupported != "jit"),
+    )
+    assert mhc_overlap.supports_mhc_overlap(config) is (unsupported == "none")
+    monkeypatch.setattr(mhc_overlap.envs, "VLLM_DSV41_MHC_OVERLAP", False)
+    assert not mhc_overlap.supports_mhc_overlap(config)
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
 @pytest.mark.parametrize(
     "num_tokens,hc_mult,hidden_size",
@@ -228,8 +283,12 @@ def test_deepseek_v41_mhc_pre_delayed(
 
 @pytest.mark.skipif(not HAS_TILELANG_MHC, reason="TileLang MHC support required")
 @pytest.mark.parametrize("entry", ["broadcast", "pipeline", "residual", "engram"])
+@pytest.mark.parametrize(
+    "mhc_mode",
+    ["disabled", "eager", "overlap", "piecewise", "twelve_tokens", "large_batch"],
+)
 def test_deepseek_v41_decoder_mixes_match_torch(
-    entry, monkeypatch, default_vllm_config
+    entry, mhc_mode, monkeypatch, default_vllm_config
 ):
     """Preserve carried pre-mixes and Engram ordering at every decoder entry."""
     set_random_seed(0)
@@ -242,6 +301,18 @@ def test_deepseek_v41_decoder_mixes_match_torch(
     decoder.hc_post_alpha = 2.0
     decoder.use_sequence_parallel = False
     decoder.engram = None
+    decoder.mhc_stream = None if mhc_mode == "disabled" else torch.cuda.Stream()
+    if mhc_mode == "overlap" and not current_platform.is_device_capability(80):
+        pytest.skip("SM80 overlap required")
+    if mhc_mode in ("eager", "piecewise", "twelve_tokens", "large_batch"):
+
+        def unexpected_overlap(*args, **kwargs):
+            pytest.fail("unsupported graph must retain native mHC")
+
+        monkeypatch.setattr(
+            "vllm.models.deepseek_v4_1.nvidia.model.mhc_pre_delayed_overlap",
+            unexpected_overlap,
+        )
     from vllm.model_executor.layers.layernorm import RMSNorm
 
     decoder.attn_norm = decoder.ffn_norm = RMSNorm(5120, 1e-6).to(
@@ -249,6 +320,9 @@ def test_deepseek_v41_decoder_mixes_match_torch(
     )
     decoder.attn = lambda positions, x, _: x * 0.5
     decoder.ffn = lambda x, input_ids: x * 0.25
+    tokens = (
+        24 if mhc_mode == "large_batch" else 12 if mhc_mode == "twelve_tokens" else 6
+    )
     with torch.device(DEVICE):
         decoder.hc_attn_fn = torch.randn(24, 20480) * 0.02
         decoder.hc_ffn_fn = torch.randn(24, 20480) * 0.02
@@ -256,18 +330,18 @@ def test_deepseek_v41_decoder_mixes_match_torch(
         decoder.hc_attn_scale = decoder.hc_ffn_scale = torch.ones(3)
         decoder.hc_attn_base = torch.randn(24)
         decoder.hc_ffn_base = torch.randn(24)
-        x = torch.randn(3, 5120, dtype=torch.bfloat16)
-        positions = torch.arange(3)
+        x = torch.randn(tokens, 5120, dtype=torch.bfloat16)
+        positions = torch.arange(tokens)
         kwargs = {}
         if entry != "broadcast":
-            kwargs["pre_mix"] = torch.rand(3, 4)
+            kwargs["pre_mix"] = torch.rand(tokens, 4)
         if entry == "pipeline":
-            x = torch.randn(3, 4, 5120, dtype=torch.bfloat16)
+            x = torch.randn(tokens, 4, 5120, dtype=torch.bfloat16)
         if entry in ("residual", "engram"):
             kwargs.update(
-                residual=torch.randn(3, 4, 5120, dtype=torch.bfloat16),
-                post_mix=torch.rand(3, 4, 1),
-                res_mix=torch.rand(3, 4, 4),
+                residual=torch.randn(tokens, 4, 5120, dtype=torch.bfloat16),
+                post_mix=torch.rand(tokens, 4, 1),
+                res_mix=torch.rand(tokens, 4, 4),
             )
         if entry == "engram":
 
@@ -278,9 +352,58 @@ def test_deepseek_v41_decoder_mixes_match_torch(
                     return residual + 0.125
 
             decoder.engram = FakeEngram()
-            kwargs["engram_hashes"] = torch.zeros(3, 1, 1, dtype=torch.int32)
+            kwargs["engram_hashes"] = torch.zeros(tokens, 1, 1, dtype=torch.int32)
 
-    actual = decoder(x, positions, None, **kwargs)
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import set_forward_context
+    from vllm.models.deepseek_v4_1.nvidia.mhc_overlap import mhc_pre_delayed_overlap
+
+    mode = CUDAGraphMode.PIECEWISE if mhc_mode == "piecewise" else CUDAGraphMode.FULL
+    overlap_calls = []
+    if mhc_mode == "overlap":
+
+        def checked_overlap(*args, **kwargs):
+            overlap_calls.append(torch.cuda.is_current_stream_capturing())
+            return mhc_pre_delayed_overlap(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "vllm.models.deepseek_v4_1.nvidia.model.mhc_pre_delayed_overlap",
+            checked_overlap,
+        )
+    # Compile split epilogues outside capture without loading an actual model.
+    if mhc_mode == "overlap":
+        scratch = torch.randn(tokens, 4, 5120, dtype=torch.bfloat16, device=DEVICE)
+        for carried, projection in (
+            (None, decoder.hc_attn_fn),
+            (None, decoder.hc_attn_fn_broadcast),
+            (torch.rand(tokens, 4, device=DEVICE), decoder.hc_attn_fn),
+        ):
+            mhc_pre_delayed_overlap(
+                scratch,
+                projection,
+                decoder.hc_attn_scale,
+                decoder.hc_attn_base,
+                1e-20,
+                1e-6,
+                1e-6,
+                2.0,
+                20,
+                pre_mix=carried,
+                x=scratch[:, 0].contiguous() if projection.shape[1] == 5120 else None,
+                norm_weight=decoder.attn_norm.weight,
+                norm_eps=1e-6,
+                stream=decoder.mhc_stream,
+            )
+            torch.cuda.current_stream().wait_stream(decoder.mhc_stream)
+    with set_forward_context(None, default_vllm_config, cudagraph_runtime_mode=mode):
+        actual = decoder(x, positions, None, **kwargs)
+        if mhc_mode in ("overlap", "piecewise", "twelve_tokens", "large_batch"):
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                actual = decoder(x, positions, None, **kwargs)
+            graph.replay()
+            if mhc_mode == "overlap":
+                assert overlap_calls == [True, True]
 
     def reference(*args, norm_weight, norm_eps, **kwargs):
         post, res, collapsed, pre = mhc_pre_delayed_torch(*args, **kwargs)
@@ -290,6 +413,7 @@ def test_deepseek_v41_decoder_mixes_match_torch(
         "vllm.models.deepseek_v4_1.nvidia.model.mhc_pre_delayed_tilelang",
         reference,
     )
+    decoder.mhc_stream = None
     expected = decoder(x, positions, None, **kwargs)
     for result, ref in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, ref, atol=2e-2, rtol=1e-2)
@@ -389,6 +513,51 @@ def hc_head_ref(
     pre_mix = torch.nn.functional.linear(residual_norm, fn)
     pre_mix = torch.sigmoid(pre_mix * hc_scale + hc_base) + hc_eps
     return torch.sum(pre_mix.unsqueeze(-1) * residual.float(), dim=-2).bfloat16()
+
+
+@pytest.mark.skipif(
+    not HAS_TILELANG_MHC or not current_platform.is_device_capability(80),
+    reason="SM80 TileLang required",
+)
+@pytest.mark.parametrize("tokens", [1, 6, 12])
+@pytest.mark.parametrize("carried", [False, True])
+def test_mhc_overlap_matches_native_after_changed_input_graph_replays(tokens, carried):
+    """Preserve BF16 collapse and FP32 coefficients while scratch dies on the host."""
+    from vllm.models.deepseek_v4_1.nvidia.mhc_overlap import mhc_pre_delayed_overlap
+
+    set_random_seed(72)
+    residual = torch.randn(tokens, 4, 5120, device=DEVICE, dtype=torch.bfloat16)
+    original = residual.clone()
+    fn = torch.randn(24, 20480, device=DEVICE) * 0.02
+    scale = torch.ones(3, device=DEVICE)
+    base = torch.randn(24, device=DEVICE)
+    pre = torch.rand(tokens, 4, device=DEVICE) if carried else None
+    norm = torch.ones(5120, device=DEVICE, dtype=torch.bfloat16)
+    args = (residual, fn, scale, base, 1e-20, 1e-6, 1e-6, 2.0, 20)
+    kwargs = dict(pre_mix=pre, norm_weight=norm)
+    stream = torch.cuda.Stream()
+
+    def split():
+        out = mhc_pre_delayed_overlap(*args, **kwargs, stream=stream)
+        torch.cuda.current_stream().wait_stream(stream)
+        return out
+
+    split()
+    mhc_pre_delayed_tilelang(*args, **kwargs)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = split()
+    for factor in (1.0, -0.75, 1.0):
+        residual.copy_(original * factor)
+        # Exercise allocation reuse after temporary mixes/sqrsum have died.
+        torch.empty(1 << 20, dtype=torch.uint8, device=DEVICE).fill_(193)
+        graph.replay()
+        expected = mhc_pre_delayed_tilelang(*args, **kwargs)
+        torch.testing.assert_close(out[2], expected[2], atol=0, rtol=0)
+        for index in (0, 1, 3):
+            torch.testing.assert_close(
+                out[index], expected[index], atol=1e-6, rtol=1e-6
+            )
 
 
 @pytest.mark.skipif(
