@@ -166,6 +166,8 @@ def _fp8_paged_mqa_logits_kernel(
     stride_bt_k,
     stride_l_t,
     stride_l_n,
+    stride_lens_b,
+    stride_lens_n,
     next_n: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -174,6 +176,7 @@ def _fp8_paged_mqa_logits_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
     Q_IS_BF16: tl.constexpr,
+    LENGTHS_2D: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     block_rk = tl.program_id(1)
@@ -181,11 +184,15 @@ def _fp8_paged_mqa_logits_kernel(
     batch_id = token_id // next_n
     next_n_id = token_id % next_n
 
-    context_len = tl.load(context_lens_ptr + batch_id)
+    context_len = tl.load(
+        context_lens_ptr
+        + batch_id * stride_lens_b
+        + (next_n_id if LENGTHS_2D else 0) * stride_lens_n
+    )
     if block_rk * block_size >= context_len:
         return
 
-    q_offset = context_len - next_n + next_n_id
+    q_offset = context_len - 1 if LENGTHS_2D else context_len - next_n + next_n_id
 
     # int64: unified-KV-pool layer views carry a large block stride (~1e6
     # elements), so int32 `block_idx * stride` wraps once a batch touches
@@ -354,6 +361,8 @@ def fp8_paged_mqa_logits_triton(
         block_tables.stride(1),
         logits.stride(0),
         logits.stride(1),
+        context_lens.stride(0),
+        context_lens.stride(1) if context_lens.ndim == 2 else 0,
         next_n=next_n,
         num_heads=num_heads,
         head_dim=head_dim,
@@ -362,6 +371,7 @@ def fp8_paged_mqa_logits_triton(
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,
         Q_IS_BF16=q_is_bf16,
+        LENGTHS_2D=context_lens.ndim == 2 and context_lens.shape[1] == next_n,
     )
     return logits
 

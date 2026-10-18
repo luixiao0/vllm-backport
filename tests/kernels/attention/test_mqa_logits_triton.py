@@ -51,6 +51,39 @@ def _pack_paged_kv(kv_bf16: torch.Tensor) -> torch.Tensor:
     return packed
 
 
+@pytest.mark.parametrize("lens_layout", ["vector", "broadcast", "per_token"])
+def test_fp8_paged_mqa_per_token_lens_preserves_causal_rows(lens_layout):
+    """Native speculative metadata supplies a different visible length per row."""
+    torch.manual_seed(71)
+    device = "cuda"
+    q = torch.randn(2, 3, 32, 128, device=device).to(torch.float8_e4m3fn)
+    cache = _pack_paged_kv(torch.randn(8, 64, 128, device=device))
+    weights = torch.rand(6, 32, device=device)
+    table = torch.tensor([[5, 2, 7], [3, 1, 6]], device=device, dtype=torch.int32)
+    lengths = torch.tensor([131, 72], device=device, dtype=torch.int32)
+    effective = lengths[:, None] + torch.arange(-2, 1, device=device)
+    if lens_layout == "per_token":
+        lens = effective.to(torch.int32)
+    elif lens_layout == "broadcast":
+        lens = lengths[:, None]
+    else:
+        lens = lengths
+    actual = fp8_paged_mqa_logits_triton(q, cache, weights, lens, table, 192)
+    for batch in range(2):
+        for token in range(3):
+            expected = fp8_paged_mqa_logits_triton(
+                q[batch : batch + 1, token : token + 1],
+                cache,
+                weights[batch * 3 + token : batch * 3 + token + 1],
+                effective[batch, token].reshape(1).to(torch.int32),
+                table[batch : batch + 1],
+                192,
+            )
+            torch.testing.assert_close(
+                actual[batch * 3 + token], expected[0], atol=0, rtol=0
+            )
+
+
 # References adapted from DeepGEMM (test_attention.py) — used as the spec
 # the Triton kernels must agree with.
 def _fp8_mqa_logits_ref(
