@@ -2310,6 +2310,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSV4_CANDIDATE_SELECTION_BACKEND": env_with_choices(
         "VLLM_DSV4_CANDIDATE_SELECTION_BACKEND", "torch", ["torch", "triton_radix"]
     ),
+    # SM80 FP8 consumer decode: score candidate positions directly, then
+    # remap native top-k to the original compressed cache coordinates.
+    "VLLM_DSV41_SPARSE_MQA": lambda: (
+        os.environ.get("VLLM_DSV41_SPARSE_MQA", "0") == "1"
+    ),
     # Row-chunk the SM80/SM86 sparse-indexer prefill logits (allover326's
     # long-context fix from #50576): compute the [M, N] fp32 logits transient
     # in blocks of this many query rows instead of monolithically, bounding

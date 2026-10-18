@@ -84,6 +84,175 @@ def test_fp8_paged_mqa_per_token_lens_preserves_causal_rows(lens_layout):
             )
 
 
+@pytest.mark.parametrize(
+    "rows,next_n,length", [(1, 1, 4097), (6, 6, 40001), (48, 6, 40001)]
+)
+@pytest.mark.parametrize("case", ["random", "zero", "empty", "nonfinite", "short"])
+def test_fp8_candidate_paged_mqa_preserves_native_topk(rows, next_n, length, case):
+    """Compact selection preserves the selected tokens AND accumulation order."""
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        apply_candidate_mask,
+    )
+    from vllm.model_executor.kernels.attention.dsa.candidate_mqa import (
+        fp8_candidate_paged_mqa_topk,
+    )
+
+    if current_platform.get_device_capability() != (8, 0):
+        pytest.skip("SM80 candidate port")
+    torch.manual_seed(312)
+    device = "cuda"
+    batch = rows // next_n
+    pages = cdiv(length, 64)
+    # Reversed physical pages and noncontiguous table/Q/weights/candidates.
+    table = torch.arange(pages - 1, -1, -1, device=device, dtype=torch.int32)
+    table = table.repeat(batch, 2)[:, ::2]
+    q = torch.randn(batch, next_n, 32, 256, device=device).to(torch.float8_e4m3fn)
+    q = q[..., ::2]
+    weights = torch.rand(rows, 64, device=device)[:, ::2]
+    cache = _pack_paged_kv(torch.randn(pages, 64, 128, device=device))
+    lens = torch.full((batch, next_n), length, device=device, dtype=torch.int32)
+    lens -= torch.arange(next_n - 1, -1, -1, device=device, dtype=torch.int32)
+    candidates = torch.randint(
+        -10, cdiv(length, 8) + 10, (rows, 4096), device=device, dtype=torch.int32
+    )[:, ::2]
+    candidates[:, :64] = torch.arange(63, -1, -1, device=device, dtype=torch.int32)
+    candidates[:, 64:70] = candidates[:, 70:76]  # duplicates and unsorted IDs
+    if case == "zero":
+        weights.zero_()
+    elif case == "empty":
+        candidates.fill_(-1)
+    elif case == "short":
+        lens.copy_(torch.arange(rows, device=device).reshape(batch, next_n) * 17)
+    elif case == "nonfinite":
+        # Cache NaN bytes are decoded through the same pinned +/-480 LUT.
+        cache.view(-1)[:128] = 127
+        weights[0, :3] = torch.tensor(
+            [float("nan"), float("inf"), -float("inf")], device=device
+        )
+    logits = fp8_paged_mqa_logits_triton(q, cache, weights, lens, table, length)
+    apply_candidate_mask(logits, None, lens.reshape(-1), candidates, 8)
+    expected = torch.empty((rows, 512), device=device, dtype=torch.int32)
+    actual = torch.empty((rows, 1024), device=device, dtype=torch.int32)[:, ::2]
+    workspace = torch.empty(1024 * 1024, device=device, dtype=torch.uint8)
+    torch.ops._C.persistent_topk(
+        logits, lens.reshape(-1), expected, workspace, 512, length
+    )
+    fp8_candidate_paged_mqa_topk(
+        q, cache, weights, lens, table, candidates, 8, actual, length, workspace
+    )
+    assert torch.equal(actual, expected), (actual, expected)
+    # Replaying with device-side lengths/candidates changed must not retain
+    # capture-time row bounds, candidate count, or a previous top-k threshold.
+    if case == "random":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            fp8_candidate_paged_mqa_topk(
+                q, cache, weights, lens, table, candidates, 8, actual, length, workspace
+            )
+        candidates.fill_(-1)
+        lens.fill_(73)
+        graph.replay()
+        torch.accelerator.synchronize()
+        reference = torch.arange(512, device=device, dtype=torch.int32)
+        reference = torch.where(reference < 73, reference, -1)
+        assert torch.equal(actual, reference.expand(rows, -1))
+
+
+def test_sparse_indexer_decode_dispatches_compact_only_for_eligible_consumers(
+    monkeypatch,
+):
+    """Run the actual custom-op body with DSpark-5 metadata, no model loading."""
+    import vllm.model_executor.layers.sparse_attn_indexer as indexer
+    import vllm.v1.worker.workspace as workspace_mod
+    from vllm.config import CUDAGraphMode
+    from vllm.forward_context import ForwardContext, override_forward_context
+    from vllm.model_executor.kernels.attention.dsa import candidate_mqa
+    from vllm.v1.attention.backends.mla.indexer import (
+        DeepSeekV32IndexerDecodeMetadata,
+        DeepseekV32IndexerMetadata,
+    )
+
+    if current_platform.get_device_capability() != (8, 0):
+        pytest.skip("SM80 candidate port")
+    torch.manual_seed(15)
+    device = "cuda"
+    rows, length, pages = 6, 131072, cdiv(131072, 128)
+    q = torch.randn(rows, 32, 128, device=device).to(torch.float8_e4m3fn)
+    cache = _pack_paged_kv(torch.randn(pages, 128, 128, device=device)).squeeze(-2)
+    weights = torch.rand(rows, 32, device=device)
+    lens = torch.arange(length - 5, length + 1, device=device, dtype=torch.int32)[None]
+    decode = DeepSeekV32IndexerDecodeMetadata(
+        block_table=torch.arange(pages, device=device, dtype=torch.int32)[None],
+        seq_lens=lens,
+        max_seq_len=length,
+        decode_lens=torch.tensor([rows], device=device, dtype=torch.int32),
+        requires_padding=False,
+        schedule_metadata=torch.empty(0, device=device, dtype=torch.int32),
+    )
+    metadata = DeepseekV32IndexerMetadata(
+        seq_lens=lens[:, -1],
+        max_seq_len=length,
+        slot_mapping=torch.arange(rows, device=device, dtype=torch.int64),
+        num_decodes=1,
+        num_decode_tokens=rows,
+        num_prefills=0,
+        num_prefill_tokens=0,
+        decode=decode,
+    )
+    context = ForwardContext(
+        {}, {"index": metadata}, {}, cudagraph_runtime_mode=CUDAGraphMode.FULL
+    )
+    manager = workspace_mod.WorkspaceManager(torch.device(device))
+    monkeypatch.setattr(workspace_mod, "_manager", manager)
+    candidates = torch.randint(0, 2500, (rows, 2048), device=device, dtype=torch.int32)
+    calls = []
+    real_compact = candidate_mqa.fp8_candidate_paged_mqa_topk
+
+    def record_compact(*args, **kwargs):
+        calls.append(True)
+        return real_compact(*args, **kwargs)
+
+    monkeypatch.setattr(candidate_mqa, "fp8_candidate_paged_mqa_topk", record_compact)
+    with override_forward_context(context):
+        outputs = []
+        for enabled, candidate_write, candidate_size, bound in [
+            (False, False, 8, length),
+            (True, False, 8, length),
+            (True, True, 8, length),
+            (True, False, 4, length),
+            (True, False, 8, 32768),
+        ]:
+            decode.max_seq_len = bound
+            lens.clamp_(max=bound)
+            monkeypatch.setenv("VLLM_DSV41_SPARSE_MQA", str(int(enabled)))
+            output = torch.empty((rows, 512), device=device, dtype=torch.int32)
+            indexer.sparse_attn_indexer(
+                torch.empty((rows, 1), device=device),
+                "index",
+                cache,
+                q,
+                None,
+                None,
+                weights,
+                128,
+                "ue8m0",
+                512,
+                128,
+                length,
+                length,
+                output,
+                True,
+                False,
+                "",
+                candidate_blocks=candidates.clone(),
+                candidate_block_size=candidate_size,
+                candidate_write=candidate_write,
+            )
+            outputs.append(output)
+    assert len(calls) == 1
+    assert torch.equal(outputs[0], outputs[1])
+
+
 # References adapted from DeepGEMM (test_attention.py) — used as the spec
 # the Triton kernels must agree with.
 def _fp8_mqa_logits_ref(

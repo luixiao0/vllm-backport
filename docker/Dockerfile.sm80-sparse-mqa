@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=vllm-sm80-serving:git-a1cc29f0eb08
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION=development
+LABEL org.opencontainers.image.source="https://github.com/luixiao0/vllm-backport" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}"
+COPY vllm /opt/sparse-mqa-overlay/vllm
+COPY tools/sm80/install-sparse-mqa-overlay.py /opt/sparse-mqa-overlay/install.py
+RUN CUDA_VISIBLE_DEVICES="" SOURCE_REVISION="${SOURCE_REVISION}" \
+    uv run --no-project python3 /opt/sparse-mqa-overlay/install.py

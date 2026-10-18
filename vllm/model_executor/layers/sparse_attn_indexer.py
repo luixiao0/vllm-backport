@@ -810,136 +810,185 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens[group_lo:group_hi]
         )
-        if current_platform.is_xpu():
-            if padded_q_scale is not None:
-                raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
-            seq_lens_xpu = (
-                seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
+        topk_indices = topk_indices_buffer[row_lo:row_hi, :topk_tokens]
+        use_sparse_mqa = (
+            envs.VLLM_DSV41_SPARSE_MQA
+            and candidate_blocks is not None
+            and not candidate_write
+            and not use_fp4_cache
+            and not use_deep_gemm
+            and not use_pcp
+            and not decode_metadata.requires_padding
+            and decode_metadata.global_seq_lens is None
+            and current_platform.is_cuda()
+            and current_platform.get_device_capability() == (8, 0)
+            and topk_tokens == 512
+            and candidate_block_size == 8
+            and candidate_blocks.shape[1] == 2048
+            and candidate_blocks.dtype == torch.int32
+            and padded_q_quant_cast.dtype == torch.float8_e4m3fn
+            and padded_q_quant_cast.shape[-2:] == (32, 128)
+            # Shared-A100 crossover screening: keep single-row and shorter
+            # context bounds on the dense path. FULL graph bounds can exceed
+            # live device lengths, so this is a conservative host gate only.
+            and row_hi - row_lo >= 6
+            and decode_metadata.max_seq_len >= 131072
+        )
+        if use_sparse_mqa:
+            assert candidate_blocks is not None
+            logger.info_once("Using candidate-only SM80 FP8 MQA consumer decode.")
+            from vllm.model_executor.kernels.attention.dsa.candidate_mqa import (
+                fp8_candidate_paged_mqa_topk,
             )
-            logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
+
+            (topk_workspace,) = current_workspace_manager().get_simultaneous(
+                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            )
+            fp8_candidate_paged_mqa_topk(
                 padded_q_quant_cast,
-                kv_cache,
-                shard_weights,
-                seq_lens_xpu,
-                block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len,
-            )
-        elif use_deep_gemm:
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
                 shard_weights,
                 seq_lens,
                 block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                clean_logits=False,
-                indices=decode_metadata.indices,
+                candidate_blocks[row_lo:row_hi],
+                candidate_block_size,
+                topk_indices,
+                decode_metadata.max_seq_len,
+                topk_workspace,
             )
         else:
-            # SM80/SM121 Triton fallback. Downstream topk reads only up to
-            # `seq_lens`, so size the buffer in the same compressed indexer
-            # coordinate system.
-            logits = fp8_paged_mqa_logits_triton(
-                padded_q_quant_cast,
-                kv_cache,
-                shard_weights,
-                seq_lens,
-                block_table,
-                max_model_len=decode_metadata.max_seq_len,
-                clean_logits=False,
-            )
-        num_rows = logits.shape[0]
-        if candidate_blocks is not None:
-            # Two-level selection (v4.1) on the decode logits; columns are
-            # request-local compressed positions. seq_lens is (B, next_n)
-            # for native spec decode (per-row effective lens) and (B, 1)
-            # otherwise. Under TP decode-sharding the logits hold only this
-            # rank's rows [row_lo, row_hi), and seq_lens was sliced to match.
-            vis = seq_lens.reshape(-1)
-            row_repeat = next_n if vis.numel() != num_rows else 1
-            vis = vis[:num_rows]
-            decode_candidates = candidate_blocks[row_lo:row_hi]
-            if candidate_write:
-                _select_candidate_blocks(
-                    logits,
-                    None,
-                    vis,
-                    decode_candidates.shape[1],
-                    candidate_block_size,
-                    decode_candidates,
-                    row_repeat,
+            if current_platform.is_xpu():
+                if padded_q_scale is not None:
+                    raise RuntimeError(
+                        "XPU fp8_paged_mqa_logits does not support FP4 Q"
+                    )
+                seq_lens_xpu = (
+                    seq_lens[:, -1].contiguous() if seq_lens.ndim == 2 else seq_lens
+                )
+                logits = torch.ops.vllm.xpu_fp8_paged_mqa_logits(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    shard_weights,
+                    seq_lens_xpu,
+                    block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len,
+                )
+            elif use_deep_gemm:
+                logits = fp8_fp4_paged_mqa_logits(
+                    (padded_q_quant_cast, padded_q_scale),
+                    kv_cache,
+                    shard_weights,
+                    seq_lens,
+                    block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    clean_logits=False,
+                    indices=decode_metadata.indices,
                 )
             else:
-                _apply_candidate_mask(
-                    logits,
-                    None,
-                    vis,
-                    decode_candidates,
-                    candidate_block_size,
-                    row_repeat,
+                # SM80/SM121 Triton fallback. Downstream topk reads only up to
+                # `seq_lens`, so size the buffer in the same compressed indexer
+                # coordinate system.
+                logits = fp8_paged_mqa_logits_triton(
+                    padded_q_quant_cast,
+                    kv_cache,
+                    shard_weights,
+                    seq_lens,
+                    block_table,
+                    max_model_len=decode_metadata.max_seq_len,
+                    clean_logits=False,
                 )
-        topk_indices = topk_indices_buffer[row_lo:row_hi, :topk_tokens]
+            num_rows = logits.shape[0]
+            if candidate_blocks is not None:
+                # Two-level selection (v4.1) on the decode logits; columns are
+                # request-local compressed positions. seq_lens is (B, next_n)
+                # for native spec decode (per-row effective lens) and (B, 1)
+                # otherwise. Under TP decode-sharding the logits hold only this
+                # rank's rows [row_lo, row_hi), and seq_lens was sliced to match.
+                vis = seq_lens.reshape(-1)
+                row_repeat = next_n if vis.numel() != num_rows else 1
+                vis = vis[:num_rows]
+                decode_candidates = candidate_blocks[row_lo:row_hi]
+                if candidate_write:
+                    _select_candidate_blocks(
+                        logits,
+                        None,
+                        vis,
+                        decode_candidates.shape[1],
+                        candidate_block_size,
+                        decode_candidates,
+                        row_repeat,
+                    )
+                else:
+                    _apply_candidate_mask(
+                        logits,
+                        None,
+                        vis,
+                        decode_candidates,
+                        candidate_block_size,
+                        row_repeat,
+                    )
+            topk_indices = topk_indices_buffer[row_lo:row_hi, :topk_tokens]
 
-        # Keyed on the batch's row count, not this rank's: a shard must not
-        # pick a different top-k kernel than the replicated path would, and a
-        # batch that fits the cooperative kernel fits it on any shard of itself.
-        use_cooperative_topk = (
-            current_platform.is_cuda()
-            and topk_tokens in (512, 1024, 2048)
-            and num_padded_tokens <= 64
-            and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
-            and current_platform.has_device_capability(90)
-            and not current_platform.is_device_capability_family(120)
-        )
-        # Deliberately NOT capability-gated, unlike the cooperative path
-        # above: persistent_topk is the portable non-cluster kernel. An SM8x
-        # corruption report (#50576) traced to a third-party vendored kernel,
-        # not this tree's topk.cu; regression coverage:
-        # tests/kernels/test_persistent_topk_band.py.
-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
-            512,
-            1024,
-            2048,
-        )
-        if use_cooperative_topk:
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            # Keyed on the batch's row count, not this rank's: a shard must not
+            # pick a different top-k kernel than the replicated path would, and a
+            # batch that fits the cooperative kernel fits it on any shard of itself.
+            use_cooperative_topk = (
+                current_platform.is_cuda()
+                and topk_tokens in (512, 1024, 2048)
+                and num_padded_tokens <= 64
+                and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
+                and current_platform.has_device_capability(90)
+                and not current_platform.is_device_capability_family(120)
             )
-            torch.ops._C.cooperative_topk(
-                logits,
-                seq_lens,
-                topk_indices,
-                topk_workspace,
-                topk_tokens,
-                attn_metadata_narrowed.max_seq_len,
+            # Deliberately NOT capability-gated, unlike the cooperative path
+            # above: persistent_topk is the portable non-cluster kernel. An SM8x
+            # corruption report (#50576) traced to a third-party vendored kernel,
+            # not this tree's topk.cu; regression coverage:
+            # tests/kernels/test_persistent_topk_band.py.
+            use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
+                512,
+                1024,
+                2048,
             )
-        elif use_persistent_topk:
-            workspace_manager = current_workspace_manager()
-            (topk_workspace,) = workspace_manager.get_simultaneous(
-                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
-            )
-            torch.ops._C.persistent_topk(
-                logits,
-                seq_lens,
-                topk_indices,
-                topk_workspace,
-                topk_tokens,
-                logits.shape[1],
-            )
-        else:
-            ops.top_k_per_row_decode(
-                logits,
-                next_n,
-                seq_lens,
-                topk_indices,
-                num_rows,
-                logits.stride(0),
-                logits.stride(1),
-                topk_tokens,
-            )
+            if use_cooperative_topk:
+                workspace_manager = current_workspace_manager()
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.cooperative_topk(
+                    logits,
+                    seq_lens,
+                    topk_indices,
+                    topk_workspace,
+                    topk_tokens,
+                    attn_metadata_narrowed.max_seq_len,
+                )
+            elif use_persistent_topk:
+                workspace_manager = current_workspace_manager()
+                (topk_workspace,) = workspace_manager.get_simultaneous(
+                    ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+                )
+                torch.ops._C.persistent_topk(
+                    logits,
+                    seq_lens,
+                    topk_indices,
+                    topk_workspace,
+                    topk_tokens,
+                    logits.shape[1],
+                )
+            else:
+                ops.top_k_per_row_decode(
+                    logits,
+                    next_n,
+                    seq_lens,
+                    topk_indices,
+                    num_rows,
+                    logits.stride(0),
+                    logits.stride(1),
+                    topk_tokens,
+                )
 
         if decode_metadata.global_seq_lens is not None:
             _merge_dcp_topk_global(
