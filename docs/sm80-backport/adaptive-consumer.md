@@ -87,9 +87,10 @@ FP32-gate result.
 
 ## Larger mHC batches and distributed scope
 
-The separate native-consumer screen compares input-first and statistics-first
-scheduling at 1/6/12/24/48 rows. Raw mHC outputs are bitwise equal at every
-shape. The larger complete consumer boundary exhibits small BF16 differences;
+An exploratory native-consumer screen compares input-first and statistics-first
+scheduling at 1/6/12/24/48 rows. That cohort used BF16-rounded gate logits;
+it is not the final FP32-gate validation. Raw mHC outputs are bitwise equal at
+every shape. The larger complete consumer boundary exhibits small BF16 differences;
 48-row serial replay itself also varies. Twelve rows regressed and 24/48 showed
 only small timing gains. The production candidate therefore retains its
 existing at-most-eight-token FULL-capture gate and FP32 coefficient path.
@@ -99,6 +100,17 @@ native MXFP4 experts and combine, plus attention-output NCCL all-reduce. Only
 one active expert per rank is materialized. Results, numerical tolerances,
 per-sample maximum-rank timing and process-exit status are recorded separately;
 single-GPU numbers above do not include those collectives.
+
+The final actual-FP32-gate TP8 run covers 1/6 rows and exits normally on all
+eight ranks. Serial/input-first/statistics-first maximum-rank medians are
+378.88/369.66/353.79 and 445.95/427.01/425.98 microseconds. One row is bitwise
+equal. Six-row serial replay itself varies: its maximum relative L2 is
+3.114e-4, versus 3.126e-4 for the candidate; raw mHC outputs remain bitwise equal.
+The earlier all-shape run's teardown failure is retained separately. The final
+probe releases captured tensors and FlashInfer's class-global workspace cache
+while MNNVL owners and EP groups remain alive, verifies zero mappings and then
+destroys the groups. This fixes the probe lifetime; no production library is
+patched. Whole-model throughput and quality remain outside these boundaries.
 
 ## Images and limits
 
