@@ -177,10 +177,68 @@ kernels, retaining the exact clamp rather than rounding the bound upward.
 The new GPU regression fails on the old image for recompilation and passes with
 the fix, alongside all 146 tests in the MQA logits suite. Growing bounds reuse
 the kernels and preserve native ordered top-k with the exact host clamp.
-**Full-model performance after this fix is pending and will be appended
-separately.** The
-old image's cold and warm results above must not be presented as post-fix
-measurements.
+
+### Post-fix long-context profile
+
+The corrected image was validated as `vllm-sm80-combined:git-156c4c51b4bb`,
+source commit `156c4c51b4bbe791be4dcd23064d81cc2aeea54d`, image ID
+`sha256:455900c5bebab4fbdb42ae41cc32cefbd1eff4d4d0472deed0e5ceb1d151e2c4`.
+These are long-profile validation results, not confirmation of a completed
+general-profile rollout. The old image's results above remain separate.
+
+| Prompt context | Concurrency | Cold throughput change | Warm throughput change |
+| --- | ---: | ---: | ---: |
+| 2K | 1 | -3.27% | +4.93% |
+| 2K | 8 | -0.48% | +1.91% |
+| 32K | 8 | +1.30% | +0.82% |
+| 128K | 1 | +1.64% | -4.89% |
+| 128K | 8 | +2.43% | +15.21% |
+
+Throughput is end-to-end output tokens/s, including prefill, summarized by the
+median of recorded repetitions. At 128K/C8, the cold pass completed in
+153.347264 seconds versus the original image's 157.068524 seconds (-2.37%
+duration), eliminating the old bug's 373.307432-second result. Cold throughput
+was 26.078 to 26.711 tokens/s (+2.43%); this cold case has one recorded pass.
+Warm throughput was 506.626052 to 583.689063 tokens/s (+15.21%), using the
+median of three repetitions; the corrected image ranged from 548.857 to 583.849
+tokens/s. Warm median TPOT improved from 11.099 to 9.667 ms (-12.90%).
+Multi-request TPOT can include interference from other requests' prefills.
+
+After the full-model workload, rank 0 had only 1 `_prepare_candidates`,
+1 `_candidate_paged_mqa`, and 2 `_restore_indices` compiled variants. The
+comparison files `comparison-fixed-long-{cold,warm}.json` and
+`comparison-fixed-128k8-{cold,warm}.json`, and `fixed-jit-variant-counts.txt`, are
+retained under the rollout task's `outputs/` directory. The mixed results at
+other sizes still do not establish a uniform throughput improvement.
+
+### Post-fix general profile
+
+The same corrected image was separately tested with sparse MQA disabled,
+retaining radix candidate selection, small-graph mHC overlap, Engram TP, and
+the cached-prompt graph path. Three repetitions per cold and warm case gave:
+
+| Prompt context | Concurrency | Cold throughput change | Warm throughput change |
+| --- | ---: | ---: | ---: |
+| 2K | 1 | +1.92% | +8.50% |
+| 2K | 8 | -0.64% | +3.47% |
+| 32K | 8 | +2.48% | -0.94% |
+| 128K | 1 | +1.75% | -6.74% |
+
+The general profile remains the deployment default for mixed traffic. These
+results show modest gains and a long-single-request warm regression, rather
+than a universal improvement. The +15.21% long-profile result at 128K/C8 is a
+separate opt-in configuration and must not be attributed to that default.
+The exact input-token hashes match the baseline for all compared requests.
+Raw results and comparisons are `fixed-general-{warm-,}chat.json` and
+`comparison-fixed-general-{cold,warm}.json` in the rollout task's `outputs/`.
+
+At 2026-10-18 18:22:17 UTC (2026-10-19 02:22:17 UTC+8), the corrected
+general-profile container was serving under `vllm_deepseek_v41_flash` on port
+18005. The published host port returned HTTP 200, and all 15 chat checks passed
+through that host port after business ingress was restored. All temporary
+maintenance firewall rules were removed. The original container and image
+were retained; the rollback script and sanitized evidence are preserved at
+`/mnt/disk2/benchmarks/dsv41-sm80-rollout-20261019/` on `a100`.
 
 Fifteen actual chat checks passed, but outputs were not bitwise identical. The
 synthetic performance benchmark fixes output length at 512 tokens; it is not a
