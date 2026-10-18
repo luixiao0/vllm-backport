@@ -15,6 +15,125 @@ from vllm.models.deepseek_v4_1.common.engram import (
 from vllm.platforms import current_platform
 
 
+@pytest.mark.parametrize("tp_size,sp", [(1, False), (8, False), (8, True)])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_engram_wkv_checkpoint_columns_and_scales_follow_tp(
+    monkeypatch, tp_size, sp, quantized
+):
+    """Real linear loaders preserve block-32 scales and SP's replicated weights."""
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.model_executor.layers.quantization import modelopt
+    from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
+        dequant_mxfp8_to_bf16,
+    )
+    from vllm.models.deepseek_v4_1.quant_config import DeepseekV4FP8Config
+
+    if not current_platform.is_cuda():
+        from vllm.model_executor.kernels.linear.mxfp8.emulation import (
+            EmulationMxfp8LinearKernel,
+        )
+        from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
+            Mxfp8LinearLayerConfig,
+        )
+
+        monkeypatch.setattr(
+            modelopt,
+            "init_mxfp8_linear_kernel",
+            lambda **kwargs: EmulationMxfp8LinearKernel(Mxfp8LinearLayerConfig()),
+        )
+
+    class SmallEmbedding(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.part_n_hash_cols = (24 + tp_size - 1) // tp_size
+
+    rank = [0]
+    for module in (engram_ops, linear, parameter):
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_world_size", lambda: tp_size
+        )
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank[0])
+    monkeypatch.setattr(engram_ops, "ParallelEngramEmbedding", SmallEmbedding)
+    monkeypatch.setattr(
+        engram_ops,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            engram_config=SimpleNamespace(cpu_offload=False),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
+        ),
+    )
+    config = SimpleNamespace(hidden_size=64, hc_mult=4, rms_norm_eps=1e-20)
+    layout = SimpleNamespace(
+        num_embeddings=[128],
+        head_dim=32,
+        primes=[[[128]]],
+        max_ngram_size=4,
+        n_heads=8,
+    )
+    n, k, m = 320, 768, 6
+    device = "cuda" if current_platform.is_cuda() else "cpu"
+    torch.manual_seed(4)
+    weight = (torch.randn(n, k) * 0.1).to(
+        torch.float8_e4m3fn if quantized else torch.float32
+    )
+    scales = torch.randint(120, 127, (n // 32, k // 32), dtype=torch.uint8)
+    expanded_scales = scales.repeat_interleave(32, dim=0)
+    x = torch.randn(
+        m, k, dtype=torch.bfloat16 if quantized else torch.float32, device=device
+    )
+    quant_config = (
+        DeepseekV4FP8Config.from_config(
+            {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [32, 32],
+                "scale_fmt": "ue8m0",
+            }
+        )
+        if quantized
+        else None
+    )
+    outputs = []
+    for r in range(tp_size) if not sp else [0, tp_size - 1]:
+        rank[0] = r
+        with torch.device(device):
+            module = Engram(config, quant_config, layout, 0, sp, "model.engram")
+        layer = module.wkv
+        width = n if sp else n // tp_size
+        start = 0 if sp else r * width
+        assert layer.output_size_per_partition == width
+        assert layer.tp_rank == (0 if sp else r)
+        layer.weight.weight_loader(layer.weight, weight)
+        if quantized:
+            layer.weight_scale.weight_loader(
+                layer.weight_scale, scales.view(torch.float8_e8m0fnu)
+            )
+            torch.testing.assert_close(
+                layer.weight_scale.cpu(),
+                expanded_scales[start : start + width],
+                rtol=0,
+                atol=0,
+            )
+        torch.testing.assert_close(
+            layer.weight.view(torch.uint8).cpu(),
+            weight[start : start + width].view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        layer.quant_method.process_weights_after_loading(layer)
+        outputs.append(layer.quant_method.apply(layer, x, None))
+    if quantized:
+        reference_weight = dequant_mxfp8_to_bf16(weight, expanded_scales).to(device)
+    else:
+        reference_weight = weight.to(device)
+    expected = x.float() @ reference_weight.float().T
+    actual = outputs[0] if sp else torch.cat(outputs, dim=-1)
+    torch.testing.assert_close(actual.float(), expected, rtol=0.008, atol=0.02)
+    if sp:
+        torch.testing.assert_close(outputs[0], outputs[-1], rtol=0, atol=0)
+
+
 def _reference_engram_post_wkv(
     hidden_states,
     kv,

@@ -1,0 +1,9 @@
+# DSV4.1 serving backports; no model or production configuration is changed.
+ARG BASE_IMAGE=vllm-sm80-radix:git-20b2ff96f8e4
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.source="https://github.com/luixiao0/vllm-backport"
+LABEL org.opencontainers.image.revision="${SOURCE_REVISION}"
+COPY vllm/models/deepseek_v4_1/common/engram.py /tmp/sm80-serving/engram.py
+COPY tools/sm80/install-serving-overlay.py /tmp/sm80-serving/install.py
+RUN CUDA_VISIBLE_DEVICES="" uv run --no-project python3 /tmp/sm80-serving/install.py

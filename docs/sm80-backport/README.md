@@ -1,18 +1,22 @@
 # SM80 backport development
 
-This fork targets A100 serving, beginning with DeepSeek V4.1 and DSpark.
+This fork targets A100 deployment of DeepSeek V4.1-Flash with DSpark.
 The first kernel project is a
 [length-aware candidate selector](candidate-selection.md) inspired by upstream
 vLLM #61039. Its SM100 DeepSelect implementation cannot run directly on SM80.
 An opt-in score-kernel prototype is available. Bounded shared-A100 correctness
-probes passed; full-suite, isolated performance, serving, and model-quality
-validation remain pending. There is no validated runtime release from this fork
-yet.
+and performance screening passed for the complete radix selector. These results
+do not measure whole-model serving throughput.
 
 A complete experimental backend replaces full-width `torch.topk` with an opt-in
 SM80-compatible [hierarchical radix selector](candidate-radix.md). It computes
 device-side lengths, parallel coarse histograms, and an exact boundary-bucket
-selection. This work must satisfy the same serving acceptance criteria.
+selection.
+
+The [Engram TP backport](engram-tp.md) ports upstream WKV output sharding onto
+the fork's native A100 MXFP8 path, targeting the inspected TP8 Flash deployment.
+Its serving candidate combines Engram sharding with the separately screened
+radix selector and excludes the slower experimental WO_A MXFP8 branch.
 
 ## Branches and provenance
 
@@ -70,7 +74,9 @@ Existing production deployments must not be changed as part of this work.
 On serving hosts, use read-only inspection or separate probes and tests. Short
 correctness probes may use spare VRAM with bounded allocation and runtime, but
 must not patch installed production files, change service configuration, or stop
-or restart any existing service. Shared-GPU timing is not performance evidence.
+or restart any existing service. Bounded shared-GPU screening is the accepted
+criterion for this work; label its timings and keep whole-model tokens/s claims
+separate.
 
 Use the repository's `AGENTS.md`, kernel-writing guidance, and microbenchmark
 guidance. Run existing correctness tests before timing and extend the nearest
@@ -81,10 +87,10 @@ The target measurement envelope is A100 SM80, TP8, DSpark with five drafts,
 short and long contexts. Keep the device, software versions, shapes, precision,
 graph mode, and cache treatment in each result artifact.
 
-A port progresses through: design, opt-in prototype, correctness, kernel A/B,
-serving and model-quality evaluation, then a pinned candidate image. The default
-path changes only when the evidence supports it. Performance claims from other
-GPU generations are hypotheses for this fork, not A100 measurements.
+A port records its design, correctness, bounded kernel A/B, and pinned candidate
+image. Record separately any full-model evaluation or serving A/B that can be
+performed without changing production. Performance claims from other GPU
+generations are hypotheses for this fork, not A100 measurements.
 
 General serving fixes from the preceding review remain a separate patch series:
 KV-load admission (#57104), grammar polling (#55931), finish reasons (#46303),

@@ -47,7 +47,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.triton_utils import tl, triton
@@ -917,13 +917,17 @@ class Engram(nn.Module):
             cpu_offload=engram_config.cpu_offload if engram_config else True,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
-        self.wkv = ReplicatedLinear(
+        # Every rank has every token without SP; split the projection columns
+        # and gather its result instead of repeating the full GEMM on each rank.
+        self.wkv = ColumnParallelLinear(
             n_hash_cols * layout.head_dim,
             self.dim * (self.hc_mult + 1),
             bias=False,
+            gather_output=True,
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.wkv",
+            disable_tp=use_sequence_parallel,
         )
         self.q_weight = nn.Parameter(
             torch.empty(self.hc_mult, self.dim, dtype=torch.bfloat16),
