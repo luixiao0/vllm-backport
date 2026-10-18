@@ -85,10 +85,23 @@ def test_fp8_paged_mqa_per_token_lens_preserves_causal_rows(lens_layout):
 
 
 @pytest.mark.parametrize(
-    "rows,next_n,length", [(1, 1, 4097), (6, 6, 40001), (48, 6, 40001)]
+    "rows,next_n,length",
+    [
+        (1, 1, 4097),
+        (6, 6, 8192),
+        (6, 6, 16384),
+        (6, 6, 16385),
+        (6, 6, 40001),
+        (48, 6, 40001),
+    ],
 )
-@pytest.mark.parametrize("case", ["random", "zero", "empty", "nonfinite", "short"])
-def test_fp8_candidate_paged_mqa_preserves_native_topk(rows, next_n, length, case):
+@pytest.mark.parametrize(
+    "case", ["random", "zero", "empty", "partial_prefix", "nonfinite", "short"]
+)
+@pytest.mark.parametrize("output_stride", [1, 2])
+def test_fp8_candidate_paged_mqa_preserves_native_topk(
+    rows, next_n, length, case, output_stride
+):
     """Compact selection preserves the selected tokens AND accumulation order."""
     from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
         apply_candidate_mask,
@@ -121,6 +134,10 @@ def test_fp8_candidate_paged_mqa_preserves_native_topk(rows, next_n, length, cas
         weights.zero_()
     elif case == "empty":
         candidates.fill_(-1)
+    elif case == "partial_prefix":
+        candidates.fill_(-1)
+        candidates[:, :3] = torch.tensor([65, 70, 65], device=device)
+        weights.zero_()
     elif case == "short":
         lens.copy_(torch.arange(rows, device=device).reshape(batch, next_n) * 17)
     elif case == "nonfinite":
@@ -132,7 +149,8 @@ def test_fp8_candidate_paged_mqa_preserves_native_topk(rows, next_n, length, cas
     logits = fp8_paged_mqa_logits_triton(q, cache, weights, lens, table, length)
     apply_candidate_mask(logits, None, lens.reshape(-1), candidates, 8)
     expected = torch.empty((rows, 512), device=device, dtype=torch.int32)
-    actual = torch.empty((rows, 1024), device=device, dtype=torch.int32)[:, ::2]
+    actual = torch.empty((rows, 512 * output_stride), device=device, dtype=torch.int32)
+    actual = actual[:, ::output_stride]
     workspace = torch.empty(1024 * 1024, device=device, dtype=torch.uint8)
     torch.ops._C.persistent_topk(
         logits, lens.reshape(-1), expected, workspace, 512, length
@@ -144,11 +162,24 @@ def test_fp8_candidate_paged_mqa_preserves_native_topk(rows, next_n, length, cas
     # Replaying with device-side lengths/candidates changed must not retain
     # capture-time row bounds, candidate count, or a previous top-k threshold.
     if case == "random":
+        original_lens, original_candidates = lens.clone(), candidates.clone()
+        initial_indices = expected.clone()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             fp8_candidate_paged_mqa_topk(
                 q, cache, weights, lens, table, candidates, 8, actual, length, workspace
             )
+        # Different rows cross the dense/compact threshold without recapture.
+        pattern = torch.tensor([0, 512, 513, 8192, 16384, 16385], device=device)
+        lens.copy_(pattern.repeat(cdiv(rows, 6))[:rows].reshape(batch, next_n))
+        lens.clamp_(max=length)
+        graph.replay()
+        logits = fp8_paged_mqa_logits_triton(q, cache, weights, lens, table, length)
+        apply_candidate_mask(logits, None, lens.reshape(-1), candidates, 8)
+        torch.ops._C.persistent_topk(
+            logits, lens.reshape(-1), expected, workspace, 512, length
+        )
+        assert torch.equal(actual, expected)
         candidates.fill_(-1)
         lens.fill_(73)
         graph.replay()
@@ -156,6 +187,10 @@ def test_fp8_candidate_paged_mqa_preserves_native_topk(rows, next_n, length, cas
         reference = torch.arange(512, device=device, dtype=torch.int32)
         reference = torch.where(reference < 73, reference, -1)
         assert torch.equal(actual, reference.expand(rows, -1))
+        lens.copy_(original_lens)
+        candidates.copy_(original_candidates)
+        graph.replay()
+        assert torch.equal(actual, initial_indices)
 
 
 def test_sparse_indexer_decode_dispatches_compact_only_for_eligible_consumers(

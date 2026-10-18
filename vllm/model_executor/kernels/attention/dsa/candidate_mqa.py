@@ -19,6 +19,13 @@ def _prepare_candidates(
     blocks,
     keep,
     compact_lengths,
+    q_bytes,
+    q_bf16,
+    lut,
+    q_stride_batch,
+    q_stride_token,
+    q_stride_head,
+    q_stride_dim,
     candidate_stride_row,
     candidate_stride_col,
     length_stride_batch,
@@ -34,6 +41,17 @@ def _prepare_candidates(
 ):
     row = tl.program_id(0).to(tl.int64)
     offset = tl.arange(0, TILE)
+    for half in tl.static_range(2):
+        query_offset = offset + half * TILE
+        byte = tl.load(
+            q_bytes
+            + row // NEXT_N * q_stride_batch
+            + row % NEXT_N * q_stride_token
+            + query_offset // 128 * q_stride_head
+            + query_offset % 128 * q_stride_dim
+        )
+        query = tl.load(lut + byte.to(tl.uint32))
+        tl.store(q_bf16 + row * 4096 + query_offset, query)
     length = tl.load(
         lengths
         + row // NEXT_N * length_stride_batch
@@ -47,24 +65,42 @@ def _prepare_candidates(
         offset < CANDIDATES,
         other=-1,
     )
-    # Include the first K context positions as masked fillers. They preserve
-    # native top-k's lowest-index -inf ties even for empty/partial candidates.
-    filler = offset - CANDIDATES
-    block = tl.where(offset < CANDIDATES, candidate, filler)
-    valid = (
-        (offset < CAPACITY) & (block >= 0) & (block < tl.cdiv(length, CANDIDATE_SIZE))
-    )
-    key = tl.where(valid, block * 2 + (offset >= CANDIDATES), 0x7FFFFFFF)
-    key = tl.sort(key, descending=False)
-    previous = tl.gather(key, tl.maximum(offset - 1, 0), 0)
-    unique = (key != 0x7FFFFFFF) & ((offset == 0) | (key // 2 != previous // 2))
-    destination = tl.cumsum(unique.to(tl.int32)) - 1
-    tl.store(blocks + row * CAPACITY + offset, -1, offset < CAPACITY)
+    filler_blocks: tl.constexpr = (TOP_K + CANDIDATE_SIZE - 1) // CANDIDATE_SIZE
+    short = length <= CANDIDATES * CANDIDATE_SIZE
+    initial = tl.where(short | (offset < filler_blocks), offset, -1)
+    tl.store(blocks + row * CAPACITY + offset, initial, offset < CAPACITY)
     tl.store(keep + row * CAPACITY + offset, 0, offset < CAPACITY)
+    tail = offset + TILE
+    tl.store(
+        blocks + row * CAPACITY + tail,
+        tl.where(short, tail, -1),
+        tail < CAPACITY,
+    )
+    tl.store(keep + row * CAPACITY + tail, 0, tail < CAPACITY)
     tl.debug_barrier()
-    tl.store(blocks + row * CAPACITY + destination, key // 2, unique)
-    tl.store(keep + row * CAPACITY + destination, key % 2 == 0, unique)
-    tl.store(compact_lengths + row, tl.sum(unique.to(tl.int32)) * CANDIDATE_SIZE)
+    valid = (candidate >= 0) & (candidate < tl.cdiv(length, CANDIDATE_SIZE))
+    # Prefix fillers preserve native lowest-index -inf ties. Short rows use
+    # identity blocks, so marking membership avoids sorting altogether.
+    tl.atomic_or(
+        keep + row * CAPACITY + candidate,
+        1,
+        valid & (short | (candidate < filler_blocks)),
+        sem="relaxed",
+    )
+    if length > CANDIDATES * CANDIDATE_SIZE:
+        # Sort candidates after the fixed prefix, halving the sorting network
+        # compared with padding candidates and fillers to 4096 lanes.
+        key = tl.where(valid & (candidate >= filler_blocks), candidate, 0x7FFFFFFF)
+        key = tl.sort(key, descending=False)
+        previous = tl.gather(key, tl.maximum(offset - 1, 0), 0)
+        unique = (key != 0x7FFFFFFF) & ((offset == 0) | (key != previous))
+        destination = filler_blocks + tl.cumsum(unique.to(tl.int32)) - 1
+        tl.store(blocks + row * CAPACITY + destination, key, unique)
+        tl.store(keep + row * CAPACITY + destination, 1, unique)
+        compact_length = (filler_blocks + tl.sum(unique.to(tl.int32))) * CANDIDATE_SIZE
+    else:
+        compact_length = length
+    tl.store(compact_lengths + row, compact_length)
 
 
 @triton.jit
@@ -196,6 +232,7 @@ def _restore_indices(
     MAX_LEN: tl.constexpr,
     LENGTHS_2D: tl.constexpr,
     DENSE_FILTERED: tl.constexpr,
+    INPLACE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     offset = tl.arange(0, TOP_K)
@@ -207,6 +244,11 @@ def _restore_indices(
     if not LENGTHS_2D:
         length = length - NEXT_N + row % NEXT_N + 1
     length = tl.minimum(tl.maximum(length, 0), MAX_LEN)
+    identity_limit: tl.constexpr = (
+        CAPACITY - (TOP_K + CANDIDATE_SIZE - 1) // CANDIDATE_SIZE
+    ) * CANDIDATE_SIZE
+    if INPLACE and length <= identity_limit:
+        return
     if length <= TOP_K:
         tl.store(
             output + row * output_stride_row + offset * output_stride_col,
@@ -230,6 +272,8 @@ def _restore_indices(
                 tl.cumsum(greater.to(tl.int32)) - 1,
                 tl.sum(greater.to(tl.int32)) + tl.cumsum((~greater).to(tl.int32)) - 1,
             )
+        if INPLACE:
+            tl.debug_barrier()
         tl.store(
             output + row * output_stride_row + destination * output_stride_col,
             restored,
@@ -259,12 +303,17 @@ def fp8_candidate_paged_mqa_topk(
     top_k = topk_indices.shape[1]
     capacity = candidate_blocks.shape[1] + triton.cdiv(top_k, candidate_block_size)
     blocks = torch.empty((rows, capacity), dtype=torch.int32, device=q.device)
-    keep = torch.empty_like(blocks, dtype=torch.uint8)
+    keep = torch.empty_like(blocks)
     lengths = torch.empty((rows,), dtype=torch.int32, device=q.device)
     logits = torch.empty(
         (rows, capacity * candidate_block_size), dtype=torch.float32, device=q.device
     )
-    indices = torch.empty((rows, top_k), dtype=torch.int32, device=q.device)
+    inplace = topk_indices.is_contiguous()
+    indices = (
+        topk_indices
+        if inplace
+        else torch.empty((rows, top_k), dtype=torch.int32, device=q.device)
+    )
     assert q.dtype == torch.float8_e4m3fn and (heads, dim) == (32, 128)
     assert kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == dim + 4
     assert context_lens.shape in ((batch,), (batch, 1), (batch, next_n))
@@ -283,23 +332,25 @@ def fp8_candidate_paged_mqa_topk(
         MAX_LEN=max_model_len,
         LENGTHS_2D=lengths_2d,
     )
+    lut = _get_e4m3fn_bf16_lut(q.device)
+    q_bf16 = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     _prepare_candidates[(rows,)](
         candidate_blocks,
         context_lens,
         blocks,
         keep,
         lengths,
+        q.view(torch.uint8),
+        q_bf16,
+        lut,
+        *q.stride(),
         *candidate_blocks.stride(),
         context_lens.stride(0),
         length_stride,
         CANDIDATES=candidate_blocks.shape[1],
-        TILE=triton.next_power_of_2(capacity),
+        TILE=triton.next_power_of_2(candidate_blocks.shape[1]),
         num_warps=8,
         **common,
-    )
-    lut = _get_e4m3fn_bf16_lut(q.device)
-    q_bf16 = lut.index_select(0, q.view(torch.uint8).reshape(-1).to(torch.int32)).view(
-        q.shape
     )
     _candidate_paged_mqa[(rows, triton.cdiv(logits.shape[1], 128))](
         q_bf16,
@@ -339,6 +390,7 @@ def fp8_candidate_paged_mqa_topk(
         context_lens.stride(0),
         length_stride,
         DENSE_FILTERED=rows > 32 or max_model_len <= 32768,
+        INPLACE=inplace,
         num_warps=4,
         **common,
     )
