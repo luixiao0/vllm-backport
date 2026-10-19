@@ -6,6 +6,6 @@ COPY tools/deepseek-recipe/requirements.txt ./requirements.txt
 RUN uv venv /opt/recipe/.venv \
     && uv pip sync --python /opt/recipe/.venv/bin/python --require-hashes \
        --only-binary :all: requirements.txt
-COPY tools/deepseek-recipe/gateway.py ./gateway.py
+COPY tools/deepseek-recipe/gateway.py tools/deepseek-recipe/THIRD_PARTY_LICENSES.txt ./
 USER 65532:65532
 ENTRYPOINT ["/opt/recipe/.venv/bin/python", "-m", "uvicorn", "gateway:create_app", "--factory", "--host", "127.0.0.1", "--port", "18006", "--limit-concurrency", "16", "--no-access-log"]
