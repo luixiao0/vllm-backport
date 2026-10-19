@@ -171,6 +171,10 @@ def create_app(settings: Settings | None = None, *, transport=None) -> FastAPI:
     settings = settings or Settings.from_env()
     tokenizer = Tokenizer.from_file(settings.tokenizer_path)
     encoding = DeepseekV41Encoding().with_tokenizer(tokenizer)
+    eos_ids = tokenizer.encode("<｜end▁of▁sentence｜>")
+    if len(eos_ids) != 1:
+        raise ValueError("The model tokenizer must encode the V4.1 EOS as one token")
+    eos_id = eos_ids[0]
     if settings.max_model_len <= 1 or settings.default_max_tokens < 1:
         raise ValueError("Model and output token limits must be positive")
     url = httpx.URL(settings.upstream_url)
@@ -313,6 +317,7 @@ def create_app(settings: Settings | None = None, *, transport=None) -> FastAPI:
         upstream, payload, processor, accumulator, response_type, stream
     ):
         finish_reason = None
+        saw_eos = False
         backend_usage = None
         terminal_outputs = []
 
@@ -356,7 +361,13 @@ def create_app(settings: Settings | None = None, *, transport=None) -> FastAPI:
                     token_ids = choice.get("token_ids")
                     if token_ids is None:
                         raise GatewayError("vLLM must support return_token_ids", 502)
-                    chunks.extend(InferenceChunk.token(token) for token in token_ids)
+                    for token in token_ids:
+                        if saw_eos:
+                            raise GatewayError("vLLM returned tokens after EOS", 502)
+                        if token == eos_id:
+                            saw_eos = True
+                        else:
+                            chunks.append(InferenceChunk.token(token))
                     if choice.get("finish_reason"):
                         finish_reason = choice["finish_reason"]
                 for chunk in chunks:

@@ -87,6 +87,8 @@ def setup_client(
         if mode == "http_error":
             return httpx.Response(503)
         tokens = codec.encode(answer, add_special_tokens=False).ids
+        # vLLM includes EOS in token_ids even though its decoded text excludes it.
+        tokens.append(codec.token_to_id("<｜end▁of▁sentence｜>"))
         messages: list[dict[str, Any]] = [
             {"choices": [{"index": 0, "token_ids": [token], "finish_reason": None}]}
             for token in tokens
